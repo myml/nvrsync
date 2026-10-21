@@ -29,7 +29,8 @@
     pending: { label: '待同步', cls: 'wait' },
     syncing: { label: '同步中', cls: 'run' },
     failed: { label: '失败', cls: 'bad' },
-    skipped: { label: '已跳过', cls: 'skip' }
+    skipped: { label: '已跳过', cls: 'skip' },
+    local_only: { label: '仅本地', cls: 'local' }
   };
 
   function $(selector, root) {
@@ -573,7 +574,8 @@
       transcode: !!raw.transcode,
       ffmpeg: typeof raw.ffmpeg === 'string' ? raw.ffmpeg : '',
       cutoff: raw.cutoff === 'yesterday' || raw.cutoff === 'days' ? raw.cutoff : 'latest',
-      cutoff_days: toInt(raw.cutoff_days, 0)
+      cutoff_days: toInt(raw.cutoff_days, 0),
+      catalog_days: toInt(raw.catalog_days, 0)
     };
   }
 
@@ -725,7 +727,8 @@
         { key: 'all', label: 'NVR 段数', icon: 'database', tone: '' },
         { key: 'done', label: '已同步', icon: 'check', tone: 'tone-ok' },
         { key: 'pending', label: '待同步', icon: 'clock', tone: 'tone-warn' },
-        { key: 'failed', label: '失败', icon: 'alert', tone: 'tone-bad' }
+        { key: 'failed', label: '失败', icon: 'alert', tone: 'tone-bad' },
+        { key: 'local', label: '仅本地', icon: 'database', tone: '' }
       ];
       view.statCards = {};
       var cards = statDefs.map(function (def) {
@@ -754,12 +757,12 @@
         el('option', { value: 'syncing', text: '同步中' }),
         el('option', { value: 'done', text: '已同步' }),
         el('option', { value: 'failed', text: '失败' }),
-        el('option', { value: 'skipped', text: '已跳过' })
+        el('option', { value: 'skipped', text: '已跳过' }),
+        el('option', { value: 'local_only', text: '仅本地' })
       ]);
       statusSelect.value = f.status || '';
 
       var refreshBtn = button('刷新', { icon: 'refresh', id: 'sync-refresh' });
-      var listBtn = button('列出 NVR 录像', { icon: 'database', id: 'sync-list' });
       var stopBtn = button('停止', { icon: 'stop', id: 'sync-stop', hidden: true });
       var startBtn = button('开始同步', { icon: 'play', variant: 'btn-primary', id: 'sync-start' });
 
@@ -768,7 +771,7 @@
         field('从', fromInput, { id: 'sync-from' }),
         field('到', toInput, { id: 'sync-to' }),
         field('状态', statusSelect, { id: 'sync-status' }),
-        el('div', { class: 'toolbar-actions' }, [listBtn, refreshBtn, stopBtn, startBtn])
+        el('div', { class: 'toolbar-actions' }, [refreshBtn, stopBtn, startBtn])
       ]);
 
       /* ---- 进度条（同步中显示） ---- */
@@ -825,7 +828,6 @@
       view.startBtn = startBtn;
       view.stopBtn = stopBtn;
       view.refreshBtn = refreshBtn;
-      view.listBtn = listBtn;
 
       syncLogsOpen(view);
 
@@ -841,14 +843,12 @@
         f.from = fromInput.value;
         f.page = 1;
         loadSegments(view);
-        refreshFromNVR(view);
       });
 
       toInput.addEventListener('change', function () {
         f.to = toInput.value;
         f.page = 1;
         loadSegments(view);
-        refreshFromNVR(view);
       });
 
       statusSelect.addEventListener('change', function () {
@@ -857,15 +857,11 @@
         loadSegments(view);
       });
 
-      listBtn.addEventListener('click', function () {
-        withBusy(listBtn, function () {
-          return refreshFromNVR(view, { loud: true });
-        });
-      });
-
       refreshBtn.addEventListener('click', function () {
         withBusy(refreshBtn, function () {
-          return Promise.all([loadStats(view), loadSegments(view), loadLogs(view)]);
+          return refreshCatalog(view, { quiet: true }).then(function () {
+            return Promise.all([loadStats(view), loadSegments(view), loadLogs(view)]);
+          });
         });
       });
 
@@ -909,6 +905,7 @@
       loadStats(view);
       loadSegments(view);
       loadLogs(view);
+      refreshCatalog(view, { quiet: true });
 
       return function cleanup() {
         view.destroyed = true;
@@ -921,30 +918,17 @@
     }
   };
 
-  /** 让当前筛选范围对应的 NVR 录像出现在列表里（只列不下载）。 */
-  async function refreshFromNVR(view, opts) {
-    var f = state.filters;
-    var today = dayBounds(isoDate(new Date()));
-    var from = f.from ? dayBounds(f.from).from : (today ? today.from : 0);
-    var to = f.to ? dayBounds(f.to).to : Math.floor(Date.now() / 1000);
-    if (!from || !to) return { ok: false };
-    var channels = f.ch ? [f.ch] : channelsFromSettings(state.settings);
-    if (!channels.length) return { ok: false };
-    var res = await api('/api/nvr/scan', {
-      method: 'POST',
-      body: { channels: channels, from: from, to: to },
-      quiet: true
-    });
-    if (res.ok) {
+  /** 后台对账：把 NVR 当前持有的录像同步进本地索引（只列不下载）。 */
+  async function refreshCatalog(view, opts) {
+    var res = await api('/api/catalog/refresh', { method: 'POST', quiet: true });
+    if (res.ok && !view.destroyed) {
       if (opts && opts.loud) {
-        toast('已列出 ' + res.data.listed + ' 段，新增 ' + res.data.added + ' 段', 'ok');
+        toast('对账完成：新增 ' + res.data.added + '，仅本地 ' + res.data.became_local + '，丢失 ' + res.data.marked_gone, 'ok');
       }
-      if (!view.destroyed) {
-        loadSegments(view);
-        loadStats(view);
-      }
-    } else if (opts && opts.loud) {
-      toast(res.error || '列出 NVR 录像失败', 'error');
+      loadStats(view);
+      loadSegments(view);
+    } else if (!res.ok && opts && opts.loud) {
+      toast(res.error || '对账失败', 'error');
     }
     return res;
   }
@@ -972,7 +956,8 @@
       { key: 'done', status: 'done' },
       { key: 'pending', status: 'pending' },
       { key: 'syncing', status: 'syncing' },
-      { key: 'failed', status: 'failed' }
+      { key: 'failed', status: 'failed' },
+      { key: 'local', status: 'local_only' }
     ];
 
     var results = await Promise.all(defs.map(function (def) {
@@ -1001,6 +986,7 @@
     var pending = counts.pending;
     var syncing = counts.syncing;
     var failed = counts.failed;
+    var localOnly = counts.local;
 
     setStat(
       view.statCards.all,
@@ -1027,6 +1013,12 @@
       view.statCards.failed,
       failed === null ? '—' : num(failed),
       failed === null ? '加载失败' : (failed > 0 ? '可在下方列表重试' : '没有失败记录')
+    );
+
+    setStat(
+      view.statCards.local,
+      localOnly === null ? '—' : num(localOnly),
+      localOnly === null ? '加载失败' : 'NVR 已覆盖，仅本地保留'
     );
   }
 
@@ -1407,12 +1399,6 @@
         ch = toInt(chSelect.value, channels[0]);
         state.recordings.ch = ch;
         load();
-      });
-
-      listBtn.addEventListener('click', function () {
-        withBusy(listBtn, function () {
-          return refreshFromNVR(view, { loud: true });
-        });
       });
 
       refreshBtn.addEventListener('click', function () {
@@ -2034,12 +2020,6 @@
         setupPlayer();
       }
 
-      listBtn.addEventListener('click', function () {
-        withBusy(listBtn, function () {
-          return refreshFromNVR(view, { loud: true });
-        });
-      });
-
       refreshBtn.addEventListener('click', function () {
         withBusy(refreshBtn, function () { return load(); });
       });
@@ -2180,6 +2160,11 @@
       min: '0', step: '1'
     });
 
+    var catalogInput = el('input', {
+      class: 'control', id: 'set-catalog', type: 'number', value: String(saved.catalog_days),
+      min: '0', step: '1'
+    });
+
     var cutoffSelect = el('select', { class: 'control', id: 'set-cutoff' }, [
       el('option', { value: 'latest' }, ['最新（约 2 分钟前）']),
       el('option', { value: 'yesterday' }, ['昨天 23:59']),
@@ -2317,6 +2302,10 @@
           hint: '只同步到此时间之前。「昨天」表示今天的录像等明天再同步，永远不会碰到正在写入的段。'
         }),
         cutoffDaysField,
+        field('列表对账范围（天）', catalogInput, {
+          id: 'set-catalog',
+          hint: '后台每 5 分钟把 NVR 仍持有的录像对账进列表；0 表示关闭自动对账。'
+        }),
         field('保留天数', retentionInput, {
           id: 'set-retention',
           hint: '0 表示不自动删除旧录像。'
@@ -2460,7 +2449,8 @@
       transcode: !!(form.querySelector('#set-transcode') || {}).checked,
       ffmpeg: String(value('set-ffmpeg')).trim(),
       cutoff: String(value('set-cutoff')).trim() || 'latest',
-      cutoff_days: toInt(value('set-cutoff-days'), 1)
+      cutoff_days: toInt(value('set-cutoff-days'), 1),
+      catalog_days: toInt(value('set-catalog'), 0)
     };
   }
 
@@ -2472,6 +2462,7 @@
     if (settings.backfill_hours < 0) return '回填小时数不能为负数';
     if (settings.retention_days < 0) return '保留天数不能为负数';
     if (settings.cutoff === 'days' && settings.cutoff_days < 1) return '截止天数至少为 1';
+    if (settings.catalog_days < 0) return '对账范围不能为负数';
     return '';
   }
 

@@ -74,10 +74,20 @@ func (p *Player) DayPlaylist(ch int, date string) ([]byte, error) {
 		To:     to,
 		Status: "done",
 	})
+	// local_only segments are no longer on the NVR but their files are on disk,
+	// so they still belong to the day playlist.
+	if more, _ := p.st.Segments(store.SegFilter{
+		Ch:     ch,
+		From:   from,
+		To:     to,
+		Status: "local_only",
+	}); len(more) > 0 {
+		found = append(found, more...)
+	}
 
 	segments := make([]store.Segment, 0, len(found))
 	for _, seg := range found {
-		if seg.Ch != ch || seg.Status != "done" {
+		if seg.Ch != ch || (seg.Status != "done" && seg.Status != "local_only") {
 			continue
 		}
 		if seg.Start < from || seg.Start >= to || seg.End <= seg.Start {

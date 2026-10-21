@@ -74,6 +74,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("PUT /api/settings", s.handlePutSettings)
 	mux.HandleFunc("POST /api/nvr/test", s.handleNVRTest)
 	mux.HandleFunc("POST /api/nvr/scan", s.handleNVRScan)
+	mux.HandleFunc("POST /api/catalog/refresh", s.handleCatalogRefresh)
 
 	mux.HandleFunc("GET /api/segments", s.handleSegments)
 
@@ -266,6 +267,22 @@ func (s *server) handleDays(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- sync -------------------------------------------------------------------
+
+// handleCatalogRefresh reconciles the local index with the NVR list.
+func (s *server) handleCatalogRefresh(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 180*time.Second)
+	defer cancel()
+	res, err := s.sy.RefreshCatalog(ctx)
+	if err != nil {
+		status := http.StatusBadGateway
+		if errors.Is(err, syncer.ErrAlreadyRunning) {
+			status = http.StatusConflict
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	writeOK(w, http.StatusOK, res)
+}
 
 // handleNVRScan lists NVR recordings for a range without downloading them, so
 // the sync page can browse any day before deciding what to pull.

@@ -24,7 +24,7 @@ type Segment struct {
     End       int64  `json:"end"`
     Size      int64  `json:"size"`       // NVR 侧字节数（media list 给的值）
     EventType int    `json:"event_type"`
-    Status    string `json:"status"`     // pending|syncing|done|failed|skipped
+    Status    string `json:"status"`     // pending|syncing|done|failed|skipped|local_only
     SyncedAt  int64  `json:"synced_at"`
     Path      string `json:"path"`       // 本地相对路径
     Bytes     int64  `json:"bytes"`      // 实际落盘字节
@@ -51,6 +51,7 @@ type Settings struct {
     // 同步截止：latest=最新（now-2min）/ yesterday=昨天 23:59 / days=N 天前 00:00
     Cutoff     string `json:"cutoff"`
     CutoffDays int    `json:"cutoff_days"`
+    CatalogDays int   `json:"catalog_days"`   // 后台对账回看天数，0=关闭
 }
 ```
 
@@ -93,6 +94,7 @@ func (p *Player) EnsureProxy(ch int, date string) error           // 可选 ffmp
 | GET | `/api/health` | `{ok,version}` |
 | GET/PUT | `/api/settings` | 读/写设置；PUT 后立即生效 |
 | POST | `/api/nvr/test` | 用当前设置登录+列一段，返回 ok/错误 |
+| POST | `/api/catalog/refresh` | 后台对账：把 NVR 仍在的录像合并进索引，NVR 已覆盖的标为 `local_only`，从没下过的标 `skipped` |
 | POST | `/api/nvr/scan` | `{channels,from,to}` 只列出 NVR 录像写入本地索引（不下载），超过截止时间的段标为 skipped |
 | GET | `/api/segments?ch=&from=&to=&status=&limit=&offset=` | 列表 + total |
 | POST | `/api/sync/start` | `{channels,from,to,force}`（from/to 可省略=自动） |

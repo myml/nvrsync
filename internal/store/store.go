@@ -78,6 +78,10 @@ type Settings struct {
 	// that is still being written.
 	Cutoff     string `json:"cutoff"`
 	CutoffDays int    `json:"cutoff_days"`
+	// CatalogDays is how far back the automatic NVR catalogue refresh looks
+	// when reconciling the local index with what the NVR still holds. 0 disables
+	// the automatic refresh.
+	CatalogDays int `json:"catalog_days"`
 }
 
 // SyncState describes the progress of the currently running (or last) sync.
@@ -367,7 +371,7 @@ func (s *Store) MaxSyncedEnd(ch int) int64 {
 
 	var max int64
 	for _, seg := range s.data.Segments {
-		if seg.Status != "done" {
+		if seg.Status != "done" && seg.Status != "local_only" {
 			continue
 		}
 		if ch > 0 && seg.Ch != ch {
@@ -458,7 +462,7 @@ func (s *Store) Days(ch int) []DayInfo {
 	s.mu.RLock()
 	days := make(map[string]*aggregate)
 	for _, seg := range s.data.Segments {
-		if seg.Status != "done" {
+		if seg.Status != "done" && seg.Status != "local_only" {
 			continue
 		}
 		if ch != 0 && seg.Ch != ch {

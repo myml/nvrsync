@@ -2245,3 +2245,9 @@ input[type="date"]::-webkit-calendar-picker-indicator {
   overflow: hidden;
   border-radius: 9px;
 }
+
+.badge.local {
+  color: #c9b8ff;
+  background: rgba(150, 120, 255, 0.1);
+  border-color: rgba(150, 120, 255, 0.24);
+}

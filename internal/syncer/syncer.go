@@ -1038,3 +1038,180 @@ func mediaListRange(ctx context.Context, client *nvr.Client, ch int, from, to in
 	}
 	return out, nil
 }
+
+// defaultCatalogDays is how far back the automatic catalogue refresh looks
+// when the setting is not positive.
+const defaultCatalogDays = 7
+
+// catalogPoll is how often the background loop reconciles with the NVR.
+const catalogPoll = 5 * time.Minute
+
+// CatalogLoop periodically re-reads the NVR recording list so the local index
+// reflects what the device still holds: new segments appear as pending and
+// segments the NVR has already overwritten become "local_only" (file kept) or
+// "skipped" (file never downloaded).
+func (s *Syncer) CatalogLoop(ctx context.Context) {
+	// Small delay so startup is not competing with the first sync.
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(20 * time.Second):
+	}
+	for {
+		settings := s.st.Settings()
+		if settings.CatalogDays > 0 && !s.Running() {
+			if _, err := s.RefreshCatalog(ctx); err != nil {
+				s.st.Log("error", "catalog", "自动对账失败: "+err.Error())
+			}
+		}
+		timer := time.NewTimer(catalogPoll)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+// RefreshCatalog lists the NVR recordings for the configured horizon and
+// reconciles the local index with them. It never downloads footage.
+func (s *Syncer) RefreshCatalog(ctx context.Context) (CatalogResult, error) {
+	var res CatalogResult
+	settings := s.st.Settings()
+	if strings.TrimSpace(settings.NVRHost) == "" {
+		return res, errors.New("nvr_host 未配置")
+	}
+	if s.Running() {
+		return res, ErrAlreadyRunning
+	}
+	channels := settings.Channels
+	if len(channels) == 0 {
+		channels = []int{1}
+	}
+	days := settings.CatalogDays
+	if days <= 0 {
+		days = defaultCatalogDays
+	}
+	now := time.Now()
+	from := now.AddDate(0, 0, -days).Unix()
+	to := now.Unix()
+	cutoff := syncCutoff(settings, now.Unix())
+
+	client := nvr.New(settings.NVRHost, settings.NVRUser, settings.NVRPass, settings.AdminPort)
+	if err := client.Login(); err != nil {
+		s.st.Log("error", "catalog", "对账登录 NVR 失败: "+err.Error())
+		return res, fmt.Errorf("登录 NVR 失败: %w", err)
+	}
+	s.st.Log("info", "catalog", fmt.Sprintf("对账开始：通道 %v，范围 %s ~ %s（最近 %d 天）",
+		channels, fmtTS(from), fmtTS(to), days))
+
+	for _, ch := range channels {
+		segs, err := mediaListRange(ctx, client, ch, from, to)
+		if err != nil {
+			s.st.Log("error", "catalog", fmt.Sprintf("cam%d 列出录像失败: %v", ch, err))
+			continue
+		}
+		segs = dropCoveredClips(segs)
+
+		known := map[segKey]bool{}
+		for _, status := range []string{"pending", "syncing", "done", "failed"} {
+			for _, old := range s.listChannel(ch, status) {
+				known[segKey{old.Ch, old.Start, old.End}] = true
+			}
+		}
+
+		present := make([]nvr.MediaSeg, 0, len(segs))
+		for _, ms := range segs {
+			present = append(present, ms)
+			key := segKey{ch, ms.Start, ms.End}
+			if known[key] {
+				continue
+			}
+			seg := store.Segment{Ch: ch, Start: ms.Start, End: ms.End, Size: ms.Size, EventType: ms.EventType}
+			switch {
+			case seg.End <= seg.Start:
+				seg.Status = "skipped"
+				seg.Err = "empty time range"
+			case seg.End > cutoff:
+				seg.Status = "skipped"
+				seg.Err = "晚于同步截止时间，暂不同步"
+			default:
+				seg.Status = "pending"
+			}
+			if err := s.st.UpsertSegment(seg); err != nil {
+				continue
+			}
+			known[key] = true
+			res.Added++
+		}
+
+		// Anything in the refreshed window that the NVR no longer returns has
+		// either been kept locally (local_only) or was never downloaded.
+		for _, status := range []string{"done", "pending", "failed", "syncing", "local_only"} {
+			for _, old := range s.listChannel(ch, status) {
+				if old.Start < from || old.Start >= to {
+					continue // outside the window we actually queried
+				}
+				if overlapsAny(old, present) {
+					continue
+				}
+				switch {
+				case status == "done" || status == "local_only":
+					if old.Path == "" {
+						continue
+					}
+					if status == "done" {
+						res.BecameLocal++
+					}
+					_ = s.st.UpsertSegment(store.Segment{
+						Ch: old.Ch, Start: old.Start, End: old.End,
+						Status: "local_only", Path: old.Path, Bytes: old.Bytes, SyncedAt: old.SyncedAt,
+					})
+				default:
+					_ = s.st.UpsertSegment(store.Segment{
+						Ch: old.Ch, Start: old.Start, End: old.End,
+						Status: "skipped", Err: "NVR 上已无此段",
+					})
+					res.MarkedGone++
+				}
+			}
+		}
+		res.Listed += len(present)
+	}
+	s.st.Log("info", "catalog", fmt.Sprintf("对账完成：NVR 上 %d 段，新增 %d，转为仅本地 %d，标记丢失 %d",
+		res.Listed, res.Added, res.BecameLocal, res.MarkedGone))
+	return res, nil
+}
+
+// CatalogResult summarises one catalogue refresh.
+type CatalogResult struct {
+	Listed      int `json:"listed"`
+	Added       int `json:"added"`
+	BecameLocal int `json:"became_local"`
+	MarkedGone  int `json:"marked_gone"`
+}
+
+// overlapsAny reports whether seg is still represented on the NVR list. Exact
+// key equality is too strict because the device can re-index a segment with a
+// slightly different end once it is closed, so a large overlap also counts.
+func overlapsAny(seg store.Segment, list []nvr.MediaSeg) bool {
+	length := seg.End - seg.Start
+	if length <= 0 {
+		return false
+	}
+	for _, other := range list {
+		start := seg.Start
+		if other.Start > start {
+			start = other.Start
+		}
+		end := seg.End
+		if other.End < end {
+			end = other.End
+		}
+		if end-start >= length*9/10 {
+			return true
+		}
+	}
+	return false
+}

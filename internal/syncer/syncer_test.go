@@ -2,6 +2,7 @@ package syncer
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -515,5 +516,39 @@ func TestDropCoveredClips(t *testing.T) {
 		if seg.EventType == 2 && seg.Start == 100 {
 			t.Errorf("covered motion clip was not dropped")
 		}
+	}
+}
+
+func TestRefreshCatalogMarksLocalOnly(t *testing.T) {
+	now := time.Now().Unix()
+	f := newFakeNVR(t, [][2]int64{{now - 3600, now - 3000}})
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := st.SaveSettings(store.Settings{
+		NVRHost: f.host(), NVRUser: "admin", NVRPass: "secret", AdminPort: f.adminPort(),
+		StorageDir: t.TempDir(), Channels: []int{1}, CatalogDays: 1,
+	}); err != nil {
+		t.Fatalf("save settings: %v", err)
+	}
+	gone := store.Segment{Ch: 1, Start: now - 7200, End: now - 7000, Status: "done", Path: "rec/cam1/gone.ts", Bytes: 123}
+	if err := st.UpsertSegment(gone); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+
+	res, err := New(st).RefreshCatalog(context.Background())
+	if err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if res.Added != 1 || res.BecameLocal != 1 {
+		t.Fatalf("result = %+v, want added=1 became_local=1", res)
+	}
+	segs, _ := st.Segments(store.SegFilter{Ch: 1, Status: "local_only"})
+	if len(segs) != 1 || segs[0].End != gone.End {
+		t.Fatalf("local_only segments = %+v", segs)
+	}
+	if segs[0].Path != gone.Path {
+		t.Errorf("path = %q, want %q", segs[0].Path, gone.Path)
 	}
 }
