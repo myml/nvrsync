@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="dark" />
+  <meta name="theme-color" content="#0f1115" />
+  <meta name="description" content="NVR Sync — 把 NVR 录像同步到本地，并按天在线回看。" />
+  <title>NVR Sync</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%234f8cff'/%3E%3Cpath d='M18 40V24l14 8 14-8v16l-14 8z' fill='%230f1115' opacity='.85'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/assets/style.css" />
+</head>
+<body>
+  <a class="skip-link" href="#app">跳到主要内容</a>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="#/sync" aria-label="NVR Sync 首页">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="6" width="12" height="12" rx="2.5"></rect>
+            <path d="M15 10.5 21 7v10l-6-3.5"></path>
+            <circle cx="9" cy="12" r="2"></circle>
+          </svg>
+        </span>
+        <span class="brand-name">NVR <span>Sync</span></span>
+      </a>
+
+      <nav class="tabs" aria-label="主导航">
+        <a class="tab" href="#/sync" data-route="sync">同步</a>
+        <a class="tab" href="#/recordings" data-route="recordings">录像</a>
+        <a class="tab" href="#/settings" data-route="settings">设置</a>
+      </nav>
+
+      <div class="sync-indicator" id="sync-indicator" data-state="idle" role="status"
+           aria-live="polite" title="同步状态：空闲">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span class="status-label" id="sync-status-label">空闲</span>
+      </div>
+    </div>
+  </header>
+
+  <main id="app" tabindex="-1"></main>
+
+  <div class="toasts" id="toasts" role="region" aria-label="通知" aria-live="polite"></div>
+
+  <!-- hls.js 已内嵌在本地，运行时不请求任何 CDN -->
+  <script src="/assets/vendor/hls.min.js"></script>
+  <script src="/assets/app.js"></script>
+</body>
+</html>

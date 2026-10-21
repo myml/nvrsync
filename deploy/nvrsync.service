@@ -1,0 +1,19 @@
+[Unit]
+Description=nvrsync — TP-Link NVR 录像同步与按天回看
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nvrsync
+Group=nvrsync
+ExecStart=/usr/local/bin/nvrsync -listen :8099 -data /var/lib/nvrsync
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/nvrsync
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
