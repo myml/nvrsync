@@ -82,6 +82,12 @@ type Settings struct {
 	// when reconciling the local index with what the NVR still holds. 0 disables
 	// the automatic refresh.
 	CatalogDays int `json:"catalog_days"`
+	// CatalogMinutes is the background reconcile interval in minutes
+	// (0 uses the built-in default).
+	CatalogMinutes int `json:"catalog_minutes"`
+	// CatalogChannels overrides which channels the catalogue refresh reads.
+	// Empty means "the same channels as syncing".
+	CatalogChannels []int `json:"catalog_channels"`
 }
 
 // SyncState describes the progress of the currently running (or last) sync.
@@ -635,6 +641,10 @@ func cloneSettings(in Settings) Settings {
 	if in.Channels != nil {
 		out.Channels = make([]int, len(in.Channels))
 		copy(out.Channels, in.Channels)
+	}
+	if in.CatalogChannels != nil {
+		out.CatalogChannels = make([]int, len(in.CatalogChannels))
+		copy(out.CatalogChannels, in.CatalogChannels)
 	}
 	return out
 }

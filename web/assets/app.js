@@ -575,7 +575,13 @@
       ffmpeg: typeof raw.ffmpeg === 'string' ? raw.ffmpeg : '',
       cutoff: raw.cutoff === 'yesterday' || raw.cutoff === 'days' ? raw.cutoff : 'latest',
       cutoff_days: toInt(raw.cutoff_days, 0),
-      catalog_days: toInt(raw.catalog_days, 0)
+      catalog_days: toInt(raw.catalog_days, 0),
+      catalog_minutes: toInt(raw.catalog_minutes, 0),
+      catalog_channels: Array.isArray(raw.catalog_channels)
+        ? raw.catalog_channels.map(function (n) { return toInt(n, 0); })
+            .filter(function (n) { return isFinite(n) && n > 0; })
+            .sort(function (a, b) { return a - b; })
+        : []
     };
   }
 
@@ -2165,6 +2171,11 @@
       min: '0', step: '1'
     });
 
+    var catalogIntervalInput = el('input', {
+      class: 'control', id: 'set-catalog-interval', type: 'number',
+      value: String(saved.catalog_minutes), min: '0', step: '1'
+    });
+
     var cutoffSelect = el('select', { class: 'control', id: 'set-cutoff' }, [
       el('option', { value: 'latest' }, ['最新（约 2 分钟前）']),
       el('option', { value: 'yesterday' }, ['昨天 23:59']),
@@ -2258,6 +2269,33 @@
       })
     ]);
 
+    var savedCatalogChannels = (saved.catalog_channels || []).slice();
+    var catalogHighest = highest;
+    savedCatalogChannels.forEach(function (ch) {
+      if (ch > catalogHighest) catalogHighest = ch;
+    });
+    var catalogGrid = el('div', { class: 'ch-grid' });
+    for (var c = 1; c <= catalogHighest; c++) {
+      var catalogBox = el('input', {
+        type: 'checkbox',
+        value: String(c),
+        id: 'set-catch-' + c,
+        checked: savedCatalogChannels.indexOf(c) >= 0
+      });
+      catalogGrid.appendChild(el('label', { class: 'ch-option', for: 'set-catch-' + c }, [
+        catalogBox,
+        el('span', { text: String(c) })
+      ]));
+    }
+    var catalogChannelsField = el('div', { class: 'field span-2' }, [
+      el('label', { text: '对账通道' }),
+      catalogGrid,
+      el('div', {
+        class: 'hint',
+        text: '不勾选表示与「同步通道」一致；只影响后台对账，不影响下载。'
+      })
+    ]);
+
     /* ---- 卡片 ---- */
     var connectionCard = el('section', { class: 'card form-card' }, [
       el('div', { class: 'card-head' }, [
@@ -2302,25 +2340,32 @@
           hint: '只同步到此时间之前。「昨天」表示今天的录像等明天再同步，永远不会碰到正在写入的段。'
         }),
         cutoffDaysField,
-        field('列表对账范围（天）', catalogInput, {
-          id: 'set-catalog',
-          hint: '后台每 5 分钟把 NVR 仍持有的录像对账进列表；0 表示关闭自动对账。'
-        }),
         field('保留天数', retentionInput, {
           id: 'set-retention',
           hint: '0 表示不自动删除旧录像。'
         }),
         ffmpegField,
-        switchRow
+        switchRow,
+        channelsField
       ])
     ]);
 
-    var channelsCard = el('section', { class: 'card form-card' }, [
+    var catalogCard = el('section', { class: 'card form-card' }, [
       el('div', { class: 'card-head' }, [
-        el('h2', {}, ['同步通道']),
-        el('span', { class: 'muted', text: '按需勾选' })
+        el('h2', {}, ['索引（对账）']),
+        el('span', { class: 'muted', text: '把 NVR 上仍存在的录像合并进列表' })
       ]),
-      el('div', { class: 'form-grid' }, [channelsField])
+      el('div', { class: 'form-grid' }, [
+        field('对账回看（天）', catalogInput, {
+          id: 'set-catalog',
+          hint: '每次都往回查这么多天的 NVR 列表；0 表示关闭自动对账。'
+        }),
+        field('对账间隔（分钟）', catalogIntervalInput, {
+          id: 'set-catalog-interval',
+          hint: '后台多久对账一次，0 表示使用默认 5 分钟。'
+        }),
+        catalogChannelsField
+      ])
     ]);
 
     var hint = el('span', { class: 'save-hint', text: '所有修改已保存' });
@@ -2343,7 +2388,7 @@
 
     form.appendChild(connectionCard);
     form.appendChild(policyCard);
-    form.appendChild(channelsCard);
+    form.appendChild(catalogCard);
     form.appendChild(actions);
 
     var baseline = JSON.stringify(collectSettings(form));
@@ -2450,7 +2495,12 @@
       ffmpeg: String(value('set-ffmpeg')).trim(),
       cutoff: String(value('set-cutoff')).trim() || 'latest',
       cutoff_days: toInt(value('set-cutoff-days'), 1),
-      catalog_days: toInt(value('set-catalog'), 0)
+      catalog_days: toInt(value('set-catalog'), 0),
+      catalog_minutes: toInt(value('set-catalog-interval'), 0),
+      catalog_channels: $$('.ch-option input:checked', catalogGrid)
+        .map(function (input) { return toInt(input.value, 0); })
+        .filter(function (n) { return n > 0; })
+        .sort(function (a, b) { return a - b; })
     };
   }
 
@@ -2463,6 +2513,7 @@
     if (settings.retention_days < 0) return '保留天数不能为负数';
     if (settings.cutoff === 'days' && settings.cutoff_days < 1) return '截止天数至少为 1';
     if (settings.catalog_days < 0) return '对账范围不能为负数';
+    if (settings.catalog_minutes < 0) return '对账间隔不能为负数';
     return '';
   }
 

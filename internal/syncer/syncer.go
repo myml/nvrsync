@@ -1043,7 +1043,7 @@ func mediaListRange(ctx context.Context, client *nvr.Client, ch int, from, to in
 // when the setting is not positive.
 const defaultCatalogDays = 7
 
-// catalogPoll is how often the background loop reconciles with the NVR.
+// catalogPoll is the fallback reconcile interval when the setting is missing.
 const catalogPoll = 5 * time.Minute
 
 // CatalogLoop periodically re-reads the NVR recording list so the local index
@@ -1064,7 +1064,11 @@ func (s *Syncer) CatalogLoop(ctx context.Context) {
 				s.st.Log("error", "catalog", "自动对账失败: "+err.Error())
 			}
 		}
-		timer := time.NewTimer(catalogPoll)
+		poll := catalogPoll
+		if settings.CatalogMinutes > 0 {
+			poll = time.Duration(settings.CatalogMinutes) * time.Minute
+		}
+		timer := time.NewTimer(poll)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -1085,7 +1089,10 @@ func (s *Syncer) RefreshCatalog(ctx context.Context) (CatalogResult, error) {
 	if s.Running() {
 		return res, ErrAlreadyRunning
 	}
-	channels := settings.Channels
+	channels := settings.CatalogChannels
+	if len(channels) == 0 {
+		channels = settings.Channels
+	}
 	if len(channels) == 0 {
 		channels = []int{1}
 	}
