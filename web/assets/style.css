@@ -2251,3 +2251,7 @@ input[type="date"]::-webkit-calendar-picker-indicator {
   background: rgba(150, 120, 255, 0.1);
   border-color: rgba(150, 120, 255, 0.24);
 }
+
+.stat-card.is-warn .stat-value {
+  color: #ffa2aa;
+}

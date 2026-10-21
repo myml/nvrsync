@@ -5,8 +5,10 @@
 //
 //	command line flag  >  environment variable  >  built-in default
 //
-// The two supported flags are -data (DataDir) and -listen (Listen), and the
-// matching environment variables are NVRSYNC_DATA and NVRSYNC_LISTEN.
+// The supported flags are -data (DataDir), -listen (Listen) and -reset-auth
+// (ResetAuth); the matching environment variables are NVRSYNC_DATA and
+// NVRSYNC_LISTEN. -reset-auth has no environment equivalent by design: it is
+// a one-shot recovery flag.
 package config
 
 import (
@@ -33,6 +35,10 @@ const (
 type Config struct {
 	DataDir string `json:"data_dir"`
 	Listen  string `json:"listen"`
+	// ResetAuth clears the stored login password and disables login
+	// protection at startup. It is the recovery path for a forgotten
+	// password and edits config.json before the HTTP server starts.
+	ResetAuth bool `json:"reset_auth"`
 }
 
 // Default returns the built-in defaults.
@@ -46,10 +52,10 @@ func Default() Config {
 // Load returns the effective configuration.
 //
 // If the process has already parsed its command-line flags (the usual pattern
-// in cmd/nvrsync and in tests), flags named "data" and "listen" that were
-// registered on the default flag set are honored. Otherwise Load parses
-// os.Args[1:] itself. In both cases environment variables fill in anything
-// that was not set explicitly.
+// in cmd/nvrsync and in tests), flags named "data", "listen" and "reset-auth"
+// that were registered on the default flag set are honored. Otherwise Load
+// parses os.Args[1:] itself. In both cases environment variables fill in
+// anything that was not set explicitly.
 func Load() (Config, error) {
 	if flag.Parsed() {
 		cfg := fromEnv()
@@ -63,6 +69,15 @@ func Load() (Config, error) {
 		if set["listen"] {
 			if f := flag.Lookup("listen"); f != nil && f.Value.String() != "" {
 				cfg.Listen = f.Value.String()
+			}
+		}
+		if set["reset-auth"] {
+			if f := flag.Lookup("reset-auth"); f != nil {
+				if getter, ok := f.Value.(flag.Getter); ok {
+					if v, ok := getter.Get().(bool); ok {
+						cfg.ResetAuth = v
+					}
+				}
 			}
 		}
 		if err := cfg.validate(); err != nil {
@@ -84,6 +99,8 @@ func Parse(args []string) (Config, error) {
 	fs.SetOutput(io.Discard)
 	fs.StringVar(&cfg.DataDir, "data", cfg.DataDir, "data directory (env "+EnvData+")")
 	fs.StringVar(&cfg.Listen, "listen", cfg.Listen, "HTTP listen address (env "+EnvListen+")")
+	fs.BoolVar(&cfg.ResetAuth, "reset-auth", false,
+		"clear the login password and disable login protection, then start normally")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}

@@ -35,6 +35,9 @@ const (
 	defaultSegmentLimit = 5000
 )
 
+// DefaultAuthUser is the login name used when Settings.AuthUser is empty.
+const DefaultAuthUser = "admin"
+
 // Segment is one recording segment reported by the NVR.
 type Segment struct {
 	Ch        int    `json:"ch"`
@@ -86,6 +89,15 @@ type Settings struct {
 	// CatalogChannels overrides which channels the catalogue refresh reads.
 	// Empty means "the same channels as syncing".
 	CatalogChannels []int `json:"catalog_channels"`
+
+	// AuthEnabled turns on password protection for the web UI and API.
+	// The zero value keeps the historical behaviour: no login required.
+	AuthEnabled bool `json:"auth_enabled"`
+	// AuthUser is the login name. Empty means DefaultAuthUser.
+	AuthUser string `json:"auth_user"`
+	// AuthHash is the bcrypt hash of the login password. It is persisted in
+	// config.json but never returned by Settings or any HTTP endpoint.
+	AuthHash string `json:"auth_hash"`
 }
 
 // SyncState describes the progress of the currently running (or last) sync.
@@ -182,24 +194,84 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// Settings returns a deep copy of the current settings.
+// Settings returns a deep copy of the current settings. The password hash is
+// cleared: config.json is the only place where it is stored, and it must never
+// reach an API response.
 func (s *Store) Settings() Settings {
 	s.settingsMu.RLock()
 	defer s.settingsMu.RUnlock()
-	return cloneSettings(s.settings)
+	out := cloneSettings(s.settings)
+	out.AuthHash = ""
+	return out
+}
+
+// AuthHash returns the bcrypt hash of the login password, or "" when no
+// password has been set. It is deliberately separate from Settings so that the
+// hash cannot leak through the settings API by accident.
+func (s *Store) AuthHash() string {
+	s.settingsMu.RLock()
+	defer s.settingsMu.RUnlock()
+	return s.settings.AuthHash
 }
 
 // SaveSettings replaces the settings and persists them atomically to
 // config.json. The in-memory value is only updated after the file write
 // succeeded, so a failed save leaves the previous settings in place.
+//
+// AuthHash is never taken from the caller: Settings() strips it, so a settings
+// round trip would otherwise erase the stored password. Use SetPassword to
+// change it and ResetAuth to clear it.
 func (s *Store) SaveSettings(settings Settings) error {
 	s.settingsMu.Lock()
 	defer s.settingsMu.Unlock()
+
+	settings.AuthHash = s.settings.AuthHash
 
 	if err := s.writeConfig(settings); err != nil {
 		return err
 	}
 	s.settings = cloneSettings(settings)
+	return nil
+}
+
+// SetPassword stores the bcrypt hash of the login password under user and
+// persists it. An empty user falls back to DefaultAuthUser. Enabling or
+// disabling login protection is a separate, explicit decision.
+func (s *Store) SetPassword(user, hash string) error {
+	user = strings.TrimSpace(user)
+	if user == "" {
+		user = DefaultAuthUser
+	}
+	if strings.TrimSpace(hash) == "" {
+		return errors.New("store: password hash must not be empty")
+	}
+
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
+
+	next := cloneSettings(s.settings)
+	next.AuthUser = user
+	next.AuthHash = hash
+	if err := s.writeConfig(next); err != nil {
+		return err
+	}
+	s.settings = next
+	return nil
+}
+
+// ResetAuth disables login protection and clears the password hash, writing
+// the result back to config.json. It is the recovery path behind -reset-auth.
+func (s *Store) ResetAuth() error {
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
+
+	next := cloneSettings(s.settings)
+	next.AuthEnabled = false
+	next.AuthHash = ""
+	if err := s.writeConfig(next); err != nil {
+		return err
+	}
+	s.settings = next
 	return nil
 }
 

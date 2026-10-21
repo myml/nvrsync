@@ -31,6 +31,21 @@ func main() {
 	}
 }
 
+// applyResetAuth clears the stored login password when -reset-auth was passed.
+// It is separate from run so the recovery flag can be tested without starting
+// the HTTP server, and it deliberately lets the process continue starting.
+func applyResetAuth(st *store.Store, reset bool) error {
+	if !reset {
+		return nil
+	}
+	if err := st.ResetAuth(); err != nil {
+		return err
+	}
+	log.Printf("login protection reset: auth_enabled=false and auth_hash cleared; " +
+		"set a new password in Settings (account security) or via POST /api/auth/password")
+	return nil
+}
+
 func run(args []string) error {
 	cfg, err := config.Parse(args)
 	if err != nil {
@@ -42,6 +57,12 @@ func run(args []string) error {
 		return fmt.Errorf("open store %q: %w", cfg.DataDir, err)
 	}
 	defer st.Close()
+
+	// Recovery path for a forgotten password. The reset happens before the
+	// server starts so the next request sees an unprotected instance.
+	if err := applyResetAuth(st, cfg.ResetAuth); err != nil {
+		return fmt.Errorf("reset auth: %w", err)
+	}
 
 	sy := syncer.New(st)
 	pl := play.New(st)

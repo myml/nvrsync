@@ -238,7 +238,8 @@
     server: '<rect x="3.5" y="4" width="17" height="7" rx="2"/><rect x="3.5" y="13" width="17" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/>',
     folder: '<path d="M3.5 7.5A2 2 0 0 1 5.5 5.5h3.2l1.8 2H19a2 2 0 0 1 2 2v7.5a2 2 0 0 1-2 2H5.5a2 2 0 0 1-2-2z"/>',
     video: '<rect x="3" y="6" width="12" height="12" rx="2.5"/><path d="M15 10.5 21 7v10l-6-3.5"/>',
-    retry: '<path d="M20 11a8 8 0 1 0-.7 4.5"/><path d="M20 4v7h-7"/>'
+    retry: '<path d="M20 11a8 8 0 1 0-.7 4.5"/><path d="M20 4v7h-7"/>',
+    bolt: '<path d="M13 2 4.5 13.5H11l-1 8.5 8.5-11H12z"/>'
   };
 
   function icon(name, className) {
@@ -286,10 +287,22 @@
      1. API 封装：fetch → {ok,data,error}，失败统一弹 toast
      ======================================================================== */
 
+  // 登录保护启用后，任何 API 401 都表示会话已失效：整页跳转到登录页。
+  // 只跳一次，且登录页自身（不加载 app.js）不会触发，避免循环。
+  var authRedirecting = false;
+
+  function handleUnauthorized() {
+    if (authRedirecting) return;
+    if (String(location.pathname).replace(/\/+$/, '') === '/login') return;
+    authRedirecting = true;
+    location.replace('/login');
+  }
+
   async function api(path, opts) {
     opts = opts || {};
     var init = {
       method: opts.method || 'GET',
+      credentials: 'same-origin',
       headers: Object.assign({ Accept: 'application/json' }, opts.headers || {})
     };
     if (opts.body !== undefined && opts.body !== null) {
@@ -304,6 +317,12 @@
       var netError = '网络错误：' + (err && err.message ? err.message : String(err));
       if (!opts.quiet) toast(netError, 'error');
       return { ok: false, error: netError, status: 0 };
+    }
+
+    // 401 统一交给登录页处理，不在这里弹 toast，避免每个轮询 / 请求各弹一条。
+    if (response.status === 401) {
+      handleUnauthorized();
+      return { ok: false, error: 'unauthorized', status: 401, unauthorized: true };
     }
 
     var raw = '';
@@ -581,7 +600,9 @@
         ? raw.catalog_channels.map(function (n) { return toInt(n, 0); })
             .filter(function (n) { return isFinite(n) && n > 0; })
             .sort(function (a, b) { return a - b; })
-        : []
+        : [],
+      auth_enabled: !!raw.auth_enabled,
+      auth_user: typeof raw.auth_user === 'string' && raw.auth_user ? raw.auth_user : 'admin'
     };
   }
 
@@ -734,7 +755,10 @@
         { key: 'done', label: '已同步', icon: 'check', tone: 'tone-ok' },
         { key: 'pending', label: '待同步', icon: 'clock', tone: 'tone-warn' },
         { key: 'failed', label: '失败', icon: 'alert', tone: 'tone-bad' },
-        { key: 'local', label: '仅本地', icon: 'database', tone: '' }
+        { key: 'local', label: '仅本地', icon: 'database', tone: '' },
+        { key: 'earliest', label: '最早录像', icon: 'clock', tone: '' },
+        { key: 'capacity', label: '本地容量', icon: 'folder', tone: '' },
+        { key: 'speed', label: '同步速率', icon: 'bolt', tone: '' }
       ];
       view.statCards = {};
       var cards = statDefs.map(function (def) {
@@ -961,74 +985,53 @@
 
     resetStats(view);
 
-    var defs = [
-      { key: 'all', status: '' },
-      { key: 'done', status: 'done' },
-      { key: 'pending', status: 'pending' },
-      { key: 'syncing', status: 'syncing' },
-      { key: 'failed', status: 'failed' },
-      { key: 'local', status: 'local_only' }
-    ];
-
-    var results = await Promise.all(defs.map(function (def) {
-      return api('/api/segments?' + queryString({ ch: ch, status: def.status, limit: 1 }), { quiet: true });
-    }));
-
+    var res = await api('/api/stats?' + queryString({ ch: ch }), { quiet: true });
     if (view.destroyed || seq !== view.statsSeq) return;
+    if (!res.ok || !res.data) {
+      Object.keys(view.statCards).forEach(function (key) {
+        statLoading(view.statCards[key], '加载失败');
+      });
+      toast('统计信息加载失败：' + (res.error || '未知错误'), 'error');
+      return;
+    }
 
-    var counts = {};
-    var firstError = '';
-    results.forEach(function (res, index) {
-      var key = defs[index].key;
-      if (res.ok) {
-        counts[key] = Number(res.data && res.data.total) || 0;
-      } else {
-        counts[key] = null;
-        if (!firstError) firstError = res.error;
-      }
-    });
-
-    if (firstError) toast('部分统计信息加载失败：' + firstError, 'error');
-
+    var d = res.data;
     var chLabel = f.ch > 0 ? 'CAM ' + f.ch : '全部通道';
-    var all = counts.all;
-    var done = counts.done;
-    var pending = counts.pending;
-    var syncing = counts.syncing;
-    var failed = counts.failed;
-    var localOnly = counts.local;
+    var donePct = d.total > 0 ? Math.round((d.done / d.total) * 100) + '%' : '0%';
 
-    setStat(
-      view.statCards.all,
-      all === null ? '—' : num(all),
-      all === null ? '加载失败' : chLabel + ' · 全部状态'
-    );
-
-    setStat(
-      view.statCards.done,
-      done === null ? '—' : num(done),
-      done === null ? '加载失败' : (all > 0 ? Math.round((done / all) * 100) + '% 已完成' : '已完成并落盘')
-    );
-
-    var pendingTotal = (pending === null && syncing === null) ? null : (pending || 0) + (syncing || 0);
+    setStat(view.statCards.all, num(d.total), chLabel + ' · 全部状态');
+    setStat(view.statCards.done, num(d.done), donePct + ' 已完成');
     setStat(
       view.statCards.pending,
-      pendingTotal === null ? '—' : num(pendingTotal),
-      pendingTotal === null
-        ? '加载失败'
-        : (syncing > 0 ? num(syncing) + ' 段正在下载' : '排队等待下载')
+      num((d.pending || 0) + (d.syncing || 0)),
+      d.syncing > 0 ? num(d.syncing) + ' 段正在下载' : '排队等待下载'
     );
+    setStat(view.statCards.failed, num(d.failed), d.failed > 0 ? '可在下方列表重试' : '没有失败记录');
+    setStat(view.statCards.local, num(d.local_only), 'NVR 已覆盖，仅本地保留');
 
     setStat(
-      view.statCards.failed,
-      failed === null ? '—' : num(failed),
-      failed === null ? '加载失败' : (failed > 0 ? '可在下方列表重试' : '没有失败记录')
+      view.statCards.earliest,
+      d.earliest ? formatDateTime(d.earliest).slice(0, 16) : '—',
+      d.days > 0 ? '覆盖 ' + num(d.days) + ' 天' : '暂无本地录像'
     );
 
+    var free = Number(d.storage_free) || 0;
+    var totalDisk = Number(d.storage_total) || 0;
+    var low = totalDisk > 0 && free / totalDisk < 0.1;
     setStat(
-      view.statCards.local,
-      localOnly === null ? '—' : num(localOnly),
-      localOnly === null ? '加载失败' : 'NVR 已覆盖，仅本地保留'
+      view.statCards.capacity,
+      formatBytes(d.bytes),
+      totalDisk > 0
+        ? (low ? '空间不足！剩余 ' : '剩余 ') + formatBytes(free) + ' / 共 ' + formatBytes(totalDisk)
+        : '存储目录未配置'
+    );
+    view.statCards.capacity.node.classList.toggle('is-warn', low);
+
+    var speed = Number(d.speed) || 0;
+    setStat(
+      view.statCards.speed,
+      speed > 0 ? speed.toFixed(1) + ' MB/s' : '—',
+      d.running ? '正在同步' : '上次同步平均'
     );
   }
 
@@ -2095,6 +2098,8 @@
         api('/api/settings').then(function (res) {
           if (view.destroyed) return;
           if (!res.ok) {
+            // 401 由全局 api() 统一跳转登录页，不再渲染错误面板。
+            if (res.unauthorized) return;
             clear(host);
             host.appendChild(statePanel({
               error: true,
@@ -2372,6 +2377,89 @@
       ])
     ]);
 
+    /* ---- 账户安全 ---- */
+    var authSwitchInput = el('input', {
+      type: 'checkbox', id: 'set-auth-enabled', checked: saved.auth_enabled
+    });
+    var authStateLabel = el('span', { text: saved.auth_enabled ? '已启用' : '已关闭' });
+    var authSwitchRow = el('div', { class: 'span-2 switch-row' }, [
+      el('div', { class: 'switch-copy' }, [
+        el('div', { class: 'switch-title', text: '启用登录保护' }),
+        el('div', {
+          class: 'switch-hint',
+          text: '开启后访问页面与 API 需要先登录；关闭时行为与之前完全一致。'
+        })
+      ]),
+      el('label', { class: 'switch', for: 'set-auth-enabled' }, [
+        authSwitchInput,
+        el('span', { class: 'track' }),
+        authStateLabel
+      ])
+    ]);
+
+    var authUserInput = el('input', {
+      class: 'control', id: 'set-auth-user', type: 'text',
+      value: saved.auth_user || 'admin', autocomplete: 'username', spellcheck: 'false'
+    });
+    var authOldInput = el('input', {
+      class: 'control', id: 'set-auth-old', type: 'password', value: '',
+      autocomplete: 'current-password'
+    });
+    var authNewInput = el('input', {
+      class: 'control', id: 'set-auth-new', type: 'password', value: '',
+      autocomplete: 'new-password'
+    });
+    var authConfirmInput = el('input', {
+      class: 'control', id: 'set-auth-confirm', type: 'password', value: '',
+      autocomplete: 'new-password'
+    });
+    var passwordBtn = button('设置新密码', {
+      icon: 'check',
+      id: 'set-auth-save',
+      title: '设置或修改登录密码'
+    });
+
+    var authFields = [
+      authSwitchRow,
+      field('用户名', authUserInput, {
+        id: 'set-auth-user',
+        hint: '默认 admin；修改后需要用新用户名登录。'
+      })
+    ];
+    if (saved.auth_enabled) {
+      authFields.push(field('当前密码', authOldInput, {
+        id: 'set-auth-old',
+        hint: '修改密码前需要验证当前密码。'
+      }));
+    }
+    authFields.push(
+      field('新密码', authNewInput, {
+        id: 'set-auth-new',
+        hint: '最长 72 字节；建议使用 8 位以上的独立密码。'
+      }),
+      field('确认新密码', authConfirmInput, { id: 'set-auth-confirm' }),
+      el('div', { class: 'field span-2' }, [
+        passwordBtn,
+        el('div', {
+          class: 'hint',
+          text: '启用登录保护后需要重新登录。忘记密码时可以删除 config.json 里的 auth_hash，' +
+            '或以 -reset-auth 参数启动 nvrsync。'
+        })
+      ])
+    );
+
+    var authCard = el('section', { class: 'card form-card' }, [
+      el('div', { class: 'card-head' }, [
+        el('h2', {}, ['账户安全']),
+        el('span', { class: 'muted', text: '登录保护与密码' })
+      ]),
+      el('div', { class: 'form-grid' }, authFields)
+    ]);
+
+    function syncAuthSwitch() {
+      authStateLabel.textContent = authSwitchInput.checked ? '已启用' : '已关闭';
+    }
+
     var hint = el('span', { class: 'save-hint', text: '所有修改已保存' });
     var testBtn = button('测试连接', {
       icon: 'server',
@@ -2393,6 +2481,7 @@
     form.appendChild(connectionCard);
     form.appendChild(policyCard);
     form.appendChild(catalogCard);
+    form.appendChild(authCard);
     form.appendChild(actions);
 
     var baseline = JSON.stringify(collectSettings(form));
@@ -2416,30 +2505,77 @@
         toast(invalid, 'error');
         return { ok: false, error: invalid };
       }
+      var authWasEnabled = !!(state.settings && state.settings.auth_enabled);
       var res = await api('/api/settings', { method: 'PUT', body: settings });
       if (res.ok) {
         var normalized = normalizeSettings(res.data || settings);
         state.settings = normalized;
         state.channels = channelsFromSettings(normalized);
         markSaved();
+        if (normalized.auth_enabled && !authWasEnabled) {
+          // 登录保护刚开启：当前会话不属于登录状态，下一步请求会 401。
+          res.authJustEnabled = true;
+          toast('已启用登录保护，请重新登录', 'success');
+          setTimeout(function () { location.replace('/login'); }, 700);
+        }
       }
       return res;
+    }
+
+    // 当前服务端是否已启用登录保护（保存后会更新）。
+    function authEnabledNow() {
+      return !!(state.settings && state.settings.auth_enabled);
     }
 
     form.addEventListener('input', refreshDirty);
     form.addEventListener('change', function (event) {
       if (event.target === switchInput) syncSwitch();
       if (event.target === cutoffSelect) syncCutoffFields();
+      if (event.target === authSwitchInput) syncAuthSwitch();
       refreshDirty();
     });
 
     switchInput.addEventListener('change', syncSwitch);
     syncCutoffFields();
+    syncAuthSwitch();
 
     saveBtn.addEventListener('click', function () {
       withBusy(saveBtn, async function () {
         var res = await persist();
-        if (res.ok) toast('设置已保存', 'success');
+        if (res.ok && !res.authJustEnabled) toast('设置已保存', 'success');
+      });
+    });
+
+    passwordBtn.addEventListener('click', function () {
+      withBusy(passwordBtn, async function () {
+        var newPassword = authNewInput.value;
+        if (!newPassword) {
+          toast('请输入新密码', 'error');
+          return;
+        }
+        if (newPassword !== authConfirmInput.value) {
+          toast('两次输入的新密码不一致', 'error');
+          return;
+        }
+        var enabled = authEnabledNow();
+        var body = {
+          user: String(authUserInput.value || '').trim() || 'admin',
+          new_password: newPassword
+        };
+        if (enabled) body.old_password = authOldInput.value;
+        var res = await api('/api/auth/password', { method: 'POST', body: body });
+        if (!res.ok) return;
+        authOldInput.value = '';
+        authNewInput.value = '';
+        authConfirmInput.value = '';
+        refreshDirty();
+        if (enabled) {
+          // 服务端已重置全部会话，当前页面必须重新登录。
+          toast('密码已更新，请重新登录', 'success');
+          setTimeout(function () { location.replace('/login'); }, 700);
+        } else {
+          toast('密码已设置，打开「启用登录保护」并保存后生效', 'success', 6500);
+        }
       });
     });
 
@@ -2450,6 +2586,7 @@
         if (dirty) {
           var saved = await persist();
           if (!saved.ok) return;
+          if (saved.authJustEnabled) return;
           toast('设置已保存，正在测试连接…', 'info');
         }
         var res = await api('/api/nvr/test', { method: 'POST' });
@@ -2504,7 +2641,10 @@
       catalog_channels: $$('#set-cat-grid input:checked', form)
         .map(function (input) { return toInt(input.value, 0); })
         .filter(function (n) { return n > 0; })
-        .sort(function (a, b) { return a - b; })
+        .sort(function (a, b) { return a - b; }),
+      auth_enabled: !!(form.querySelector('#set-auth-enabled') || {}).checked,
+      // 绝不包含 auth_hash：服务端只接受通过 /api/auth/password 设置密码。
+      auth_user: String(value('set-auth-user')).trim() || 'admin'
     };
   }
 
@@ -2518,6 +2658,7 @@
     if (settings.cutoff === 'days' && settings.cutoff_days < 1) return '截止天数至少为 1';
     if (settings.catalog_days < 0) return '对账范围不能为负数';
     if (settings.catalog_minutes < 0) return '对账间隔不能为负数';
+    if (settings.auth_user.length > 64) return '用户名不能超过 64 个字符';
     return '';
   }
 
@@ -2619,6 +2760,10 @@
 
     // 通道列表来自设置；失败时使用 1..8 兜底，页面仍然可用。
     var res = await api('/api/settings', { quiet: true });
+    if (res.unauthorized) {
+      // 已开始跳转登录页，不再渲染骨架或弹错误 toast。
+      return;
+    }
     if (res.ok && res.data) {
       state.settings = normalizeSettings(res.data);
       state.channels = channelsFromSettings(res.data);

@@ -51,6 +51,7 @@ type server struct {
 	pl     *play.Player
 	assets fs.FS
 	ver    string
+	auth   *authManager
 }
 
 // New returns the complete HTTP handler: JSON API, media files and the SPA.
@@ -61,8 +62,10 @@ func New(st *store.Store, sy *syncer.Syncer, pl *play.Player, assets fs.FS, ver 
 	if assets == nil {
 		assets = web.Sub()
 	}
-	s := &server{st: st, sy: sy, pl: pl, assets: assets, ver: ver}
-	return withMiddleware(s.routes())
+	s := &server{st: st, sy: sy, pl: pl, assets: assets, ver: ver, auth: newAuthManager()}
+	// Logging/panic recovery stays outermost; authentication runs before any
+	// business handler.
+	return withMiddleware(s.authMiddleware(s.routes()))
 }
 
 // routes registers every endpoint from ARCH.md.
@@ -72,11 +75,17 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("GET /api/settings", s.handleGetSettings)
 	mux.HandleFunc("PUT /api/settings", s.handlePutSettings)
+
+	mux.HandleFunc("POST /api/login", s.handleLogin)
+	mux.HandleFunc("POST /api/logout", s.handleLogout)
+	mux.HandleFunc("POST /api/auth/password", s.handleAuthPassword)
+
 	mux.HandleFunc("POST /api/nvr/test", s.handleNVRTest)
 	mux.HandleFunc("POST /api/nvr/scan", s.handleNVRScan)
 	mux.HandleFunc("POST /api/catalog/refresh", s.handleCatalogRefresh)
 
 	mux.HandleFunc("GET /api/segments", s.handleSegments)
+	mux.HandleFunc("GET /api/stats", s.handleStats)
 
 	mux.HandleFunc("POST /api/sync/start", s.handleSyncStart)
 	mux.HandleFunc("POST /api/sync/stop", s.handleSyncStop)
@@ -89,6 +98,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /media/{ch}/{date}/{file}", s.handleMedia)
 
 	mux.Handle("GET /assets/", http.StripPrefix("/assets/", s.assetHandler()))
+	mux.HandleFunc("GET /login", s.handleLoginPage)
 	mux.HandleFunc("GET /{$}", s.handleIndex)
 	mux.HandleFunc("GET /sync", s.handleIndex)
 	mux.HandleFunc("GET /recordings", s.handleIndex)
@@ -128,18 +138,41 @@ func (s *server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid settings: "+err.Error())
 		return
 	}
+	// Settings() strips the hash, so the frontend never sends it back. Enabling
+	// login without a stored password would lock everyone out.
+	if in.AuthEnabled && s.st.AuthHash() == "" {
+		writeError(w, http.StatusBadRequest, "set a login password before enabling login protection")
+		return
+	}
+	if in.AuthEnabled && strings.TrimSpace(in.AuthUser) == "" {
+		in.AuthUser = store.DefaultAuthUser
+	}
 	if err := validateSettings(in); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	before := s.st.Settings()
 	if err := s.st.SaveSettings(in); err != nil {
 		writeError(w, http.StatusInternalServerError, "save settings: "+err.Error())
 		return
 	}
+	saved := s.st.Settings()
+	// A password change already resets sessions; also invalidate them when
+	// login protection is switched on/off or the login name changes, so a
+	// re-enabled instance cannot resurrect old tokens.
+	if before.AuthEnabled != saved.AuthEnabled || before.AuthUser != saved.AuthUser {
+		s.auth.resetAll()
+	}
+	if !before.AuthEnabled && saved.AuthEnabled {
+		s.st.Log("info", "auth", "login protection enabled")
+	}
+	if before.AuthEnabled && !saved.AuthEnabled {
+		s.st.Log("info", "auth", "login protection disabled")
+	}
 	// Nothing to restart: the syncer reads the latest settings from the store
 	// at the start of every loop iteration and before each download.
 	s.st.Log("info", "settings", "settings updated")
-	writeOK(w, http.StatusOK, s.st.Settings())
+	writeOK(w, http.StatusOK, saved)
 }
 
 // validateSettings rejects values that would make the syncer loop misbehave.
@@ -159,6 +192,9 @@ func validateSettings(v store.Settings) error {
 		if ch <= 0 {
 			return fmt.Errorf("channels must contain positive channel numbers, got %d", ch)
 		}
+	}
+	if user := strings.TrimSpace(v.AuthUser); len(user) > 64 || strings.ContainsAny(user, "\r\n\t") {
+		return fmt.Errorf("auth_user must be at most 64 characters and contain no control characters")
 	}
 	return nil
 }
@@ -198,6 +234,28 @@ func (s *server) handleNVRTest(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- segments / days --------------------------------------------------------
+
+// handleStats serves the sync page dashboard in one request.
+func (s *server) handleStats(w http.ResponseWriter, r *http.Request) {
+	ch, err := parseIntParam(r.URL.Query().Get("ch"), 0)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid ch: "+err.Error())
+		return
+	}
+	state := s.st.SyncState()
+	resp := struct {
+		store.Stats
+		Speed     float64 `json:"speed"`
+		Running   bool    `json:"running"`
+		StartedAt int64   `json:"started_at"`
+	}{
+		Stats:     s.st.Stats(ch),
+		Speed:     state.Speed,
+		Running:   state.Running,
+		StartedAt: state.StartedAt,
+	}
+	writeOK(w, http.StatusOK, resp)
+}
 
 func (s *server) handleSegments(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
