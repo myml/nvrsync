@@ -1038,27 +1038,37 @@ func dropCoveredClips(segs []nvr.MediaSeg) []nvr.MediaSeg {
 // mediaListRange lists recordings for an arbitrary range by querying the NVR
 // one local day at a time: a single wide query silently under-reports on this
 // firmware once it spans several days.
+//
+// Days are walked from newest to oldest and the walk stops after
+// mediaListEmptyStop consecutive empty days, so a "look back 365 days" setting
+// costs about as many queries as the device actually has footage for instead of
+// 365 (× channels) requests.
 func mediaListRange(ctx context.Context, client *nvr.Client, ch int, from, to int64) ([]nvr.MediaSeg, error) {
 	var out []nvr.MediaSeg
-	for start := from; start < to; {
-		day := time.Unix(start, 0).In(time.Local)
-		next := time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, time.Local).AddDate(0, 0, 1).Unix()
-		if next <= start {
-			next = start + 86400
+	emptyStreak := 0
+	for end := to; end > from; {
+		day := time.Unix(end-1, 0).In(time.Local)
+		start := time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, time.Local).Unix()
+		if start < from {
+			start = from
 		}
-		if next > to {
-			next = to
-		}
-		segs, err := client.MediaListContext(ctx, ch, start, next)
+		segs, err := client.MediaListContext(ctx, ch, start, end)
 		switch {
 		case errors.Is(err, nvr.ErrNoMedia):
 			// no recording in this slice
 		case err != nil:
 			return out, err
 		default:
+			emptyStreak = 0
 			out = append(out, segs...)
 		}
-		start = next
+		if len(segs) == 0 {
+			emptyStreak++
+			if emptyStreak >= mediaListEmptyStop {
+				return out, nil
+			}
+		}
+		end = start
 		// Be gentle with the NVR: a 30-day, 8-channel refresh is ~240
 		// requests, and firing them back-to-back makes the device answer
 		// -40401 (busy).
@@ -1071,15 +1081,19 @@ func mediaListRange(ctx context.Context, client *nvr.Client, ch int, from, to in
 	return out, nil
 }
 
-// defaultCatalogDays is how far back the automatic catalogue refresh looks
-// when the setting is not positive.
-const defaultCatalogDays = 7
+// mediaListEmptyStop ends the backwards day walk after this many consecutive
+// days without recordings.
+const mediaListEmptyStop = 7
 
 // mediaListPace is the pause between day-sized media list queries.
 const mediaListPace = 150 * time.Millisecond
 
 // catalogPoll is the fallback reconcile interval when the setting is missing.
 const catalogPoll = 5 * time.Minute
+
+// defaultCatalogDays is how far back the catalogue refresh looks when the
+// setting is not positive.
+const defaultCatalogDays = 7
 
 // CatalogLoop periodically re-reads the NVR recording list so the local index
 // reflects what the device still holds: new segments appear as pending and
