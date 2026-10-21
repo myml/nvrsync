@@ -1,0 +1,4 @@
+nvrsync
+*.log
+/data/
+.DS_Store

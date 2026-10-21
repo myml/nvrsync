@@ -1,0 +1,119 @@
+# nvrsync — 架构与接口契约
+
+NVR 录像同步 + 在线按天回看。单二进制（Go + 内嵌前端），无外部运行时依赖（可选 ffmpeg 做转码代理）。
+
+## 目录与归属
+
+```
+cmd/nvrsync/main.go       入口：flag/env → config → store → syncer → api
+internal/config/config.go 配置结构 + 默认值 + 校验
+internal/store/store.go   JSON 持久化（segments / logs / settings / sync state）
+internal/nvr/             NVR 协议客户端（/ds 管理 API + 8000 下载）
+internal/syncer/syncer.go 同步引擎（扫描→排队→下载→落盘→记账）
+internal/play/play.go     按天 HLS 播放列表 + 可选 ffmpeg 转码缓存
+internal/api/api.go       HTTP API + go:embed web
+web/                      前端静态资源（内嵌）
+```
+
+## 数据模型（JSON 文件，默认 `$DATA/store.json`）
+
+```go
+type Segment struct {
+    Ch        int    `json:"ch"`         // 物理通道 1..N
+    Start     int64  `json:"start"`      // unix 秒
+    End       int64  `json:"end"`
+    Size      int64  `json:"size"`       // NVR 侧字节数（media list 给的值）
+    EventType int    `json:"event_type"`
+    Status    string `json:"status"`     // pending|syncing|done|failed|skipped
+    SyncedAt  int64  `json:"synced_at"`
+    Path      string `json:"path"`       // 本地相对路径
+    Bytes     int64  `json:"bytes"`      // 实际落盘字节
+    Err       string `json:"err"`
+}
+type LogEntry struct {
+    TS    int64  `json:"ts"`
+    Level string `json:"level"`  // info|warn|error
+    Kind  string `json:"kind"`   // scan|download|play|settings
+    Msg   string `json:"msg"`
+}
+type Settings struct {
+    NVRHost     string `json:"nvr_host"`      // 192.168.0.49:8000
+    NVRUser     string `json:"nvr_user"`
+    NVRPass     string `json:"nvr_pass"`
+    AdminPort   int    `json:"admin_port"`    // 管理 API 端口，默认 80（会自动试 8081/8080）
+    StorageDir  string `json:"storage_dir"`   // 录像落盘根目录
+    Channels    []int  `json:"channels"`      // 要同步的通道
+    AutoMinutes int    `json:"auto_minutes"`  // 自动同步间隔（分钟），0=关闭
+    BackfillH   int    `json:"backfill_hours"`// 首次回填时长
+    RetentionD  int    `json:"retention_days"`// 0=不删
+    Transcode   bool   `json:"transcode"`     // 是否用 ffmpeg 生成 H.264 代理
+    FFmpeg      string `json:"ffmpeg"`        // ffmpeg 路径
+}
+```
+
+锁：store 内部 `sync.RWMutex`，每次写用「临时文件 + rename」保证原子性。
+
+## 关键接口
+
+```go
+// store
+func Open(dir string) (*Store, error)
+func (s *Store) Settings() Settings
+func (s *Store) SaveSettings(Settings) error
+func (s *Store) Segments(f SegFilter) []Segment
+func (s *Store) UpsertSegment(Segment) error
+func (s *Store) Log(level, kind, msg string)
+func (s *Store) Logs(limit int) []LogEntry
+func (s *Store) Days(ch int) []DayInfo   // 按天聚合：日期、段数、时长、字节
+func (s *Store) SyncState() SyncState
+
+// nvr
+func (c *Client) Login() error                       // /ds 登录拿 stok
+func (c *Client) MediaList(ch int, from, to int64) ([]MediaSeg, error)
+func (c *Client) Download(ch int, from, to int64, w io.Writer, ackInterval time.Duration) (n int64, err error)
+
+// syncer
+func New(st *store.Store) *Syncer
+func (s *Syncer) Start(req SyncRequest) error   // 异步；返回后进度走 SyncState
+func (s *Syncer) Stop()
+func (s *Syncer) Running() bool
+
+// play
+func (p *Player) DayPlaylist(ch int, date string) ([]byte, error) // HLS m3u8
+func (p *Player) EnsureProxy(ch int, date string) error           // 可选 ffmpeg
+```
+
+## HTTP API
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/health` | `{ok,version}` |
+| GET/PUT | `/api/settings` | 读/写设置；PUT 后立即生效 |
+| POST | `/api/nvr/test` | 用当前设置登录+列一段，返回 ok/错误 |
+| GET | `/api/segments?ch=&from=&to=&status=&limit=&offset=` | 列表 + total |
+| POST | `/api/sync/start` | `{channels,from,to,force}`（from/to 可省略=自动） |
+| POST | `/api/sync/stop` | |
+| GET | `/api/sync/status` | `{running,cur,total,bytes,speed,started_at}` |
+| GET | `/api/logs?limit=&level=` | 同步历史日志 |
+| GET | `/api/days?ch=` | `[{date,segments,seconds,bytes}]` |
+| GET | `/api/playlist?ch=&date=` | m3u8（`Content-Type: application/vnd.apple.mpegurl`） |
+| GET | `/media/<ch>/<date>/<file>` | 原始 TS，支持 Range |
+| GET | `/` `/sync` `/recordings` `/settings` | SPA 页面（同一 index.html） |
+
+## 存储布局
+
+```
+$DATA/
+  store.json                      # 元数据
+  rec/cam1/2026-10-21/07-00-00_08-00-00.ts
+  rec/cam1/2026-10-21/07-00-00_08-00-00.ts.json   # sidecar
+  cache/hls/cam1/2026-10-21/...                   # 转码缓存（可选）
+```
+
+## UI（3 页，深色、卡片式）
+
+- **同步**：顶部统计卡（NVR 段数 / 已同步 / 待同步 / 失败）；筛选（通道、日期、状态）；
+  表格列：通道、时间段、大小、状态、同步时间、操作（立即同步）；底部「同步日志」时间线（level 着色、可折叠、自动刷新）。
+- **录像**：天卡片墙（日期、通道数、总时长、大小）→ 点开某天进入时间轴播放器；
+  时间轴为一天 24h 的进度条，按段着色，点击跳转；播放器用 hls.js，加载 `/api/playlist`。
+- **设置**：NVR 地址/账号/密码、存储目录、通道多选、自动同步间隔、回填时长、保留天数、转码开关 + ffmpeg 路径；保存/测试连接按钮。
