@@ -14,7 +14,23 @@ TP-Link NVR 录像 → 本地/NAS 定时同步 + 按天在线回看。**单二�
 - **同步截止**：可选「最新 / 昨天 / N 天前」，只同步已封盘录像，不会碰到正在写入的段
 - **零依赖**：前端资源 `go:embed` 进二进制；元数据 JSON 原子写，sidecar 随录像落盘
 
+[![docker](https://github.com/myml/nvrsync/actions/workflows/docker.yml/badge.svg)](https://github.com/myml/nvrsync/actions/workflows/docker.yml)
+
 ## 快速开始
+
+### Docker
+
+```bash
+docker run -d --name nvrsync \
+  -p 8099:8099 \
+  -v /srv/nvrsync:/data \
+  --restart unless-stopped \
+  ghcr.io/myml/nvrsync:latest
+```
+
+镜像支持 `linux/amd64` 与 `linux/arm64`；`/data` 里是 `config.json`（设置）、`nvrsync.db`（SQLite：录像段/日志/同步状态）和 `rec/`（录像文件）。
+
+### 本地构建
 
 ```bash
 go build -o nvrsync ./cmd/nvrsync
@@ -28,7 +44,8 @@ go build -o nvrsync ./cmd/nvrsync
 
 ```
 data/
-  store.json                     # 元数据（段状态/日志/设置）
+  config.json                    # 设置（NVR 地址/账号/通道/同步策略）
+  nvrsync.db                     # SQLite：录像段、日志、同步状态
   rec/cam1/2026-10-21/07-00-00_08-00-00.ts        # 录像
   rec/cam1/2026-10-21/07-00-00_08-00-00.ts.json   # sidecar
   cache/hls/...                  # 转码缓存（可选）

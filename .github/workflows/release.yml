@@ -1,0 +1,40 @@
+name: release
+
+# Builds standalone binaries and attaches them to the GitHub release for a tag.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: linux, goarch: armv7 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          out="nvrsync_${GITHUB_REF_NAME}_${GOOS}_${GOARCH}"
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$out" ./cmd/nvrsync
+          tar -czf "$out.tar.gz" "$out"
+          sha256sum "$out.tar.gz" > "$out.tar.gz.sha256"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            nvrsync_*.tar.gz
+            nvrsync_*.tar.gz.sha256
+          generate_release_notes: true

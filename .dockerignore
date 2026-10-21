@@ -1,0 +1,8 @@
+.git
+.github
+data
+*.md
+!README.md
+nvrsync
+scripts
+deploy

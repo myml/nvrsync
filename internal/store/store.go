@@ -1,12 +1,13 @@
-// Package store provides the JSON-backed persistence layer for nvrsync.
+// Package store provides the persistence layer for nvrsync.
 //
-// All metadata lives in a single file, $DATA/store.json. Every mutation is
-// serialized with a mutex, applied to the in-memory snapshot and then written
-// to a temporary file which is renamed over store.json. This makes each write
-// atomic: a reader either sees the complete old file or the complete new one.
+// Settings live in a small JSON file, $DATA/config.json, which is rewritten
+// atomically (write to a temporary file, fsync, rename). Everything else --
+// segments, logs and sync progress -- lives in a SQLite database,
+// $DATA/nvrsync.db, using the pure-Go modernc.org/sqlite driver.
 package store
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,22 +20,19 @@ import (
 )
 
 const (
-	fileName    = "store.json"
-	tmpFileName = "store.json.tmp"
+	configFileName = "config.json"
+	configTmpName  = "config.json.tmp"
+	dbFileName     = "nvrsync.db"
 
-	// maxLogs is the number of log entries kept in memory (and on disk).
+	// maxLogs is the number of log entries kept in the database.
 	maxLogs = 5000
 
-	// Log persistence is batched once the buffer grows: small stores are
-	// flushed on every entry, larger ones at most every logPersistEvery
-	// entries (or every logPersistAge, whichever comes first).
-	logPersistEvery = 128
-	logPersistAge   = 2 * time.Second
+	// defaultLogLimit is used by Logs when the caller asks for a
+	// non-positive number of entries.
+	defaultLogLimit = 1000
 
 	// defaultSegmentLimit caps a Segments query with a non-positive Limit.
 	defaultSegmentLimit = 5000
-
-	formatVersion = 1
 )
 
 // Segment is one recording segment reported by the NVR.
@@ -129,37 +127,25 @@ type SegFilter struct {
 	Offset int
 }
 
-// storeData is the on-disk representation of the whole store.
-type storeData struct {
-	Version   int        `json:"version"`
-	Settings  Settings   `json:"settings"`
-	Segments  []Segment  `json:"segments"`
-	Logs      []LogEntry `json:"logs"`
-	SyncState SyncState  `json:"sync_state"`
-}
-
-// Store is a concurrency-safe JSON-backed metadata store.
+// Store is a concurrency-safe persistence layer: settings in config.json and
+// segments/logs/sync state in SQLite.
 type Store struct {
-	dir  string
-	path string
+	dir        string
+	configPath string
+	dbPath     string
 
-	// mu guards data. It is held for reads while copying values out and for
-	// writes while mutating the in-memory state.
-	mu   sync.RWMutex
-	data storeData
+	db *sql.DB
 
-	// writeMu serializes writers and, in particular, file writes. It is always
-	// acquired before mu so the lock order is consistent.
-	writeMu sync.Mutex
-
-	// Log persistence bookkeeping, guarded by writeMu.
-	logSeq      uint64
-	savedLogSeq uint64
-	lastLogSave time.Time
+	// settingsMu guards settings. SaveSettings holds the write lock across
+	// the atomic file write so readers never observe settings that are not
+	// on disk yet.
+	settingsMu sync.RWMutex
+	settings   Settings
 }
 
-// Open opens (or creates) the store rooted at dir and reads $dir/store.json.
-// When the file does not exist yet, an empty store is written immediately.
+// Open opens (or creates) the store rooted at dir. It creates nvrsync.db and
+// config.json as needed. A legacy store.json is deliberately ignored: this
+// version has not shipped and does not migrate old data automatically.
 func Open(dir string) (*Store, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, errors.New("store: data directory must not be empty")
@@ -169,117 +155,110 @@ func Open(dir string) (*Store, error) {
 	}
 
 	s := &Store{
-		dir:  dir,
-		path: filepath.Join(dir, fileName),
+		dir:        dir,
+		configPath: filepath.Join(dir, configFileName),
+		dbPath:     filepath.Join(dir, dbFileName),
 	}
 
-	raw, err := os.ReadFile(s.path)
-	switch {
-	case err == nil:
-		var d storeData
-		if err := json.Unmarshal(raw, &d); err != nil {
-			return nil, fmt.Errorf("store: decode %s: %w", s.path, err)
-		}
-		d.normalize()
-		s.data = d
-		s.logSeq = uint64(len(d.Logs))
-		s.savedLogSeq = s.logSeq
+	db, err := openDB(s.dbPath)
+	if err != nil {
+		return nil, err
+	}
+	s.db = db
 
-	case errors.Is(err, os.ErrNotExist):
-		s.data = storeData{
-			Version:  formatVersion,
-			Settings: Settings{Channels: []int{}},
-			Segments: []Segment{},
-			Logs:     []LogEntry{},
-		}
-		s.writeMu.Lock()
-		err = s.writeFile(s.data)
-		s.writeMu.Unlock()
-		if err != nil {
-			return nil, err
-		}
-
-	default:
-		return nil, fmt.Errorf("store: read %s: %w", s.path, err)
+	if err := s.loadOrCreateSettings(); err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 
 	return s, nil
 }
 
-// Settings returns a copy of the current settings.
-func (s *Store) Settings() Settings {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return cloneSettings(s.data.Settings)
+// Close releases the SQLite connection. It is safe to call more than once.
+func (s *Store) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Close()
 }
 
-// SaveSettings replaces the settings and persists them atomically.
+// Settings returns a deep copy of the current settings.
+func (s *Store) Settings() Settings {
+	s.settingsMu.RLock()
+	defer s.settingsMu.RUnlock()
+	return cloneSettings(s.settings)
+}
+
+// SaveSettings replaces the settings and persists them atomically to
+// config.json. The in-memory value is only updated after the file write
+// succeeded, so a failed save leaves the previous settings in place.
 func (s *Store) SaveSettings(settings Settings) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
 
-	s.mu.Lock()
-	old := s.data.Settings
-	s.data.Settings = cloneSettings(settings)
-	snap := s.snapshotLocked()
-	s.mu.Unlock()
-
-	if err := s.writeFile(snap); err != nil {
-		s.mu.Lock()
-		s.data.Settings = old
-		s.mu.Unlock()
+	if err := s.writeConfig(settings); err != nil {
 		return err
 	}
-	s.noteSaved()
+	s.settings = cloneSettings(settings)
 	return nil
 }
 
-// Segments returns the segments matching f, sorted by start time and then
-// channel, together with the total number of matches before pagination.
+// Segments returns the segments matching f, sorted by start time, channel and
+// end time, together with the total number of matches before pagination.
 // A non-positive Limit is capped at 5000; Offset is applied after sorting.
 func (s *Store) Segments(f SegFilter) ([]Segment, int) {
+	out := []Segment{}
 	if f.Limit <= 0 {
 		f.Limit = defaultSegmentLimit
 	}
 	if f.Offset < 0 {
 		f.Offset = 0
 	}
-
-	s.mu.RLock()
-	matches := make([]Segment, 0)
-	if !(f.From > 0 && f.To > 0 && f.From > f.To) {
-		for _, seg := range s.data.Segments {
-			if !segmentMatches(seg, f) {
-				continue
-			}
-			matches = append(matches, seg)
-		}
+	// Preserve the historical behaviour of an explicitly inverted range:
+	// there is no overlap to report.
+	if f.From > 0 && f.To > 0 && f.From > f.To {
+		return out, 0
 	}
-	s.mu.RUnlock()
 
-	sort.Slice(matches, func(i, j int) bool {
-		a, b := matches[i], matches[j]
-		if a.Start != b.Start {
-			return a.Start < b.Start
-		}
-		if a.Ch != b.Ch {
-			return a.Ch < b.Ch
-		}
-		return a.End < b.End
-	})
+	where, args := segmentWhere(f)
 
-	total := len(matches)
+	// The count and the page come from one read transaction so a concurrent
+	// writer cannot make the total disagree with the returned rows.
+	tx, err := s.db.Begin()
+	if err != nil {
+		return out, 0
+	}
+	defer tx.Rollback() //nolint:errcheck // read-only transaction
+
+	var total int
+	if err := tx.QueryRow("SELECT COUNT(*) FROM segments"+where, args...).Scan(&total); err != nil {
+		return out, 0
+	}
 	if f.Offset >= total {
-		return []Segment{}, total
+		return out, total
 	}
-	matches = matches[f.Offset:]
-	if len(matches) > f.Limit {
-		matches = matches[:f.Limit]
+
+	query := "SELECT " + segmentColumns + " FROM segments" + where +
+		" ORDER BY start_ts ASC, ch ASC, end_ts ASC LIMIT ? OFFSET ?"
+	queryArgs := make([]any, 0, len(args)+2)
+	queryArgs = append(queryArgs, args...)
+	queryArgs = append(queryArgs, f.Limit, f.Offset)
+
+	rows, err := tx.Query(query, queryArgs...)
+	if err != nil {
+		return out, total
 	}
-	if matches == nil {
-		matches = []Segment{}
+
+	for rows.Next() {
+		seg, err := scanSegment(rows)
+		if err != nil {
+			rows.Close()
+			return out, total
+		}
+		out = append(out, seg)
 	}
-	return matches, total
+	rows.Close()
+	return out, total
 }
 
 // UpsertSegment inserts a segment or merges it into the existing one with the
@@ -287,84 +266,26 @@ func (s *Store) Segments(f SegFilter) ([]Segment, int) {
 // stored values; a non-empty Status also replaces Err so that a successful
 // retry clears a previous error.
 func (s *Store) UpsertSegment(seg Segment) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	s.mu.Lock()
-	idx := -1
-	for i := range s.data.Segments {
-		if sameKey(s.data.Segments[i], seg) {
-			idx = i
-			break
-		}
+	_, err := s.db.Exec(upsertSegmentSQL,
+		seg.Ch, seg.Start, seg.End, seg.Size, seg.EventType, seg.Status,
+		seg.SyncedAt, seg.Path, seg.Bytes, seg.Err,
+	)
+	if err != nil {
+		return fmt.Errorf("store: upsert segment: %w", err)
 	}
-	var old Segment
-	if idx >= 0 {
-		old = s.data.Segments[idx]
-		s.data.Segments[idx] = mergeSegment(old, seg)
-	} else {
-		s.data.Segments = append(s.data.Segments, seg)
-	}
-	snap := s.snapshotLocked()
-	s.mu.Unlock()
-
-	if err := s.writeFile(snap); err != nil {
-		s.mu.Lock()
-		if idx >= 0 {
-			if idx < len(s.data.Segments) {
-				s.data.Segments[idx] = old
-			}
-		} else {
-			for i := len(s.data.Segments) - 1; i >= 0; i-- {
-				if sameKey(s.data.Segments[i], seg) {
-					s.data.Segments = append(s.data.Segments[:i], s.data.Segments[i+1:]...)
-					break
-				}
-			}
-		}
-		s.mu.Unlock()
-		return err
-	}
-	s.noteSaved()
 	return nil
 }
 
 // DeleteSegment removes the segment identified by (ch, start, end). Deleting a
 // missing segment is not an error.
 func (s *Store) DeleteSegment(ch int, start, end int64) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	key := Segment{Ch: ch, Start: start, End: end}
-
-	s.mu.Lock()
-	idx := -1
-	for i := range s.data.Segments {
-		if sameKey(s.data.Segments[i], key) {
-			idx = i
-			break
-		}
+	_, err := s.db.Exec(
+		"DELETE FROM segments WHERE ch = ? AND start_ts = ? AND end_ts = ?",
+		ch, start, end,
+	)
+	if err != nil {
+		return fmt.Errorf("store: delete segment: %w", err)
 	}
-	if idx < 0 {
-		s.mu.Unlock()
-		return nil
-	}
-	old := s.data.Segments[idx]
-	s.data.Segments = append(s.data.Segments[:idx], s.data.Segments[idx+1:]...)
-	snap := s.snapshotLocked()
-	s.mu.Unlock()
-
-	if err := s.writeFile(snap); err != nil {
-		s.mu.Lock()
-		restored := make([]Segment, 0, len(s.data.Segments)+1)
-		restored = append(restored, s.data.Segments[:idx]...)
-		restored = append(restored, old)
-		restored = append(restored, s.data.Segments[idx:]...)
-		s.data.Segments = restored
-		s.mu.Unlock()
-		return err
-	}
-	s.noteSaved()
 	return nil
 }
 
@@ -372,91 +293,68 @@ func (s *Store) DeleteSegment(ch int, start, end int64) error {
 // ch. A non-positive ch considers all channels. It returns 0 when there is no
 // such segment.
 func (s *Store) MaxSyncedEnd(ch int) int64 {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+	query := "SELECT COALESCE(MAX(end_ts), 0) FROM segments WHERE status = 'done'"
+	args := []any{}
+	if ch > 0 {
+		query += " AND ch = ?"
+		args = append(args, ch)
+	}
 	var max int64
-	for _, seg := range s.data.Segments {
-		if seg.Status != "done" && seg.Status != "local_only" {
-			continue
-		}
-		if ch > 0 && seg.Ch != ch {
-			continue
-		}
-		if seg.End > max {
-			max = seg.End
-		}
+	if err := s.db.QueryRow(query, args...).Scan(&max); err != nil {
+		return 0
 	}
 	return max
 }
 
-// Log appends a log entry, keeps at most maxLogs entries in memory/on disk and
-// prints the entry to standard output with a timestamp.
+// Log appends a log entry, keeps at most maxLogs entries in the database and
+// prints the entry to standard output with a timestamp. Logging failures are
+// reported to standard error but never returned, because logging must not
+// break a sync.
 func (s *Store) Log(level, kind, msg string) {
 	now := time.Now()
 	entry := LogEntry{TS: now.Unix(), Level: level, Kind: kind, Msg: msg}
-
-	s.writeMu.Lock()
-	s.mu.Lock()
-	s.data.Logs = append(s.data.Logs, entry)
-	if n := len(s.data.Logs); n > maxLogs {
-		kept := make([]LogEntry, maxLogs)
-		copy(kept, s.data.Logs[n-maxLogs:])
-		s.data.Logs = kept
+	if err := s.appendLog(entry); err != nil {
+		fmt.Fprintf(os.Stderr, "store: append log: %v\n", err)
 	}
-	s.logSeq++
-	seq := s.logSeq
-
-	persist := s.shouldPersistLogLocked(now, seq)
-	var snap storeData
-	if persist {
-		snap = s.snapshotLocked()
-	}
-	s.mu.Unlock()
-
-	if persist {
-		if err := s.writeFile(snap); err != nil {
-			// Logging must not fail, so a failed flush only means the entry
-			// will be written with the next snapshot. Throttle retries so a
-			// broken disk does not turn every log line into a failed write.
-			s.lastLogSave = now
-			fmt.Fprintf(os.Stderr, "store: persist logs: %v\n", err)
-		} else {
-			s.savedLogSeq = seq
-			s.lastLogSave = now
-		}
-	}
-	s.writeMu.Unlock()
-
 	fmt.Fprintf(os.Stdout, "%s [%s] %s: %s\n",
 		now.Format("2006-01-02 15:04:05"), level, kind, msg)
 }
 
 // Logs returns up to limit log entries, newest first. A non-positive limit
-// means all entries and an empty level means all levels.
+// means 1000 entries and an empty level means all levels.
 func (s *Store) Logs(limit int, level string) []LogEntry {
-	if limit < 0 {
-		limit = 0
+	if limit <= 0 {
+		limit = defaultLogLimit
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	out := make([]LogEntry, 0)
-	for i := len(s.data.Logs) - 1; i >= 0; i-- {
-		e := s.data.Logs[i]
-		if level != "" && e.Level != level {
-			continue
+	query := "SELECT ts, level, kind, msg FROM logs"
+	args := []any{}
+	if level != "" {
+		query += " WHERE level = ?"
+		args = append(args, level)
+	}
+	query += " ORDER BY id DESC LIMIT ?"
+	args = append(args, limit)
+
+	out := []LogEntry{}
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var e LogEntry
+		if err := rows.Scan(&e.TS, &e.Level, &e.Kind, &e.Msg); err != nil {
+			return out
 		}
 		out = append(out, e)
-		if limit > 0 && len(out) >= limit {
-			break
-		}
 	}
 	return out
 }
 
-// Days aggregates successfully synced segments by local calendar day,
-// newest day first. A non-zero ch restricts the result to that channel.
+// Days aggregates successfully synced segments by local calendar day, newest
+// day first. A non-zero ch restricts the result to that channel.
 func (s *Store) Days(ch int) []DayInfo {
 	type aggregate struct {
 		chs      map[int]struct{}
@@ -465,29 +363,43 @@ func (s *Store) Days(ch int) []DayInfo {
 		bytes    int64
 	}
 
-	s.mu.RLock()
+	query := "SELECT ch, start_ts, end_ts, bytes FROM segments WHERE status IN ('done', 'local_only')"
+	args := []any{}
+	if ch != 0 {
+		query += " AND ch = ?"
+		args = append(args, ch)
+	}
+
 	days := make(map[string]*aggregate)
-	for _, seg := range s.data.Segments {
-		if seg.Status != "done" && seg.Status != "local_only" {
-			continue
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return []DayInfo{}
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			segCh int
+			start int64
+			end   int64
+			bytes int64
+		)
+		if err := rows.Scan(&segCh, &start, &end, &bytes); err != nil {
+			break
 		}
-		if ch != 0 && seg.Ch != ch {
-			continue
-		}
-		date := time.Unix(seg.Start, 0).In(time.Local).Format("2006-01-02")
+		date := time.Unix(start, 0).In(time.Local).Format("2006-01-02")
 		agg := days[date]
 		if agg == nil {
 			agg = &aggregate{chs: make(map[int]struct{})}
 			days[date] = agg
 		}
-		agg.chs[seg.Ch] = struct{}{}
+		agg.chs[segCh] = struct{}{}
 		agg.segments++
-		if d := seg.End - seg.Start; d > 0 {
+		if d := end - start; d > 0 {
 			agg.seconds += d
 		}
-		agg.bytes += seg.Bytes
+		agg.bytes += bytes
 	}
-	s.mu.RUnlock()
 
 	out := make([]DayInfo, 0, len(days))
 	for date, agg := range days {
@@ -505,90 +417,100 @@ func (s *Store) Days(ch int) []DayInfo {
 
 // SyncState returns the current sync progress.
 func (s *Store) SyncState() SyncState {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.data.SyncState
+	var data string
+	if err := s.db.QueryRow("SELECT data FROM sync_state WHERE id = 1").Scan(&data); err != nil {
+		return SyncState{}
+	}
+	var state SyncState
+	if err := json.Unmarshal([]byte(data), &state); err != nil {
+		return SyncState{}
+	}
+	return state
 }
 
 // SetSyncState replaces the sync progress and persists it. Persistence
 // failures are ignored because the syncer only reports progress through this
-// method; the value is still updated in memory.
+// method.
 func (s *Store) SetSyncState(state SyncState) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	s.mu.Lock()
-	old := s.data.SyncState
-	s.data.SyncState = state
-	snap := s.snapshotLocked()
-	s.mu.Unlock()
-
-	if err := s.writeFile(snap); err != nil {
-		s.mu.Lock()
-		s.data.SyncState = old
-		s.mu.Unlock()
+	raw, err := json.Marshal(state)
+	if err != nil {
 		return
 	}
-	s.noteSaved()
+	_, _ = s.db.Exec(
+		"INSERT INTO sync_state (id, data) VALUES (1, ?) "+
+			"ON CONFLICT(id) DO UPDATE SET data = excluded.data",
+		string(raw),
+	)
 }
 
-// shouldPersistLogLocked reports whether the just-appended log entry should be
-// flushed now. s.mu and s.writeMu must be held.
-func (s *Store) shouldPersistLogLocked(now time.Time, seq uint64) bool {
-	// Small stores are cheap to flush and should be durable right away.
-	if seq <= 512 {
-		return true
-	}
-	if seq-s.savedLogSeq >= logPersistEvery {
-		return true
-	}
-	// A store loaded from disk has no lastLogSave yet; flush the first new
-	// entry immediately so recent history survives a quick restart.
-	return s.lastLogSave.IsZero() || now.Sub(s.lastLogSave) >= logPersistAge
-}
-
-// noteSaved records that a snapshot containing the current logs was persisted.
-// s.writeMu must be held.
-func (s *Store) noteSaved() {
-	s.savedLogSeq = s.logSeq
-	s.lastLogSave = time.Now()
-}
-
-// snapshotLocked copies the in-memory state so it can be marshaled without
-// holding the lock. s.mu must be held (read or write).
-func (s *Store) snapshotLocked() storeData {
-	d := s.data
-	if s.data.Segments != nil {
-		d.Segments = make([]Segment, len(s.data.Segments))
-		copy(d.Segments, s.data.Segments)
-	}
-	if s.data.Logs != nil {
-		d.Logs = make([]LogEntry, len(s.data.Logs))
-		copy(d.Logs, s.data.Logs)
-	}
-	d.Settings = cloneSettings(s.data.Settings)
-	return d
-}
-
-// writeFile atomically writes the snapshot to store.json via a temporary file
-// and rename. s.writeMu must be held.
-func (s *Store) writeFile(d storeData) error {
-	if err := os.MkdirAll(s.dir, 0o755); err != nil {
-		return fmt.Errorf("store: create data directory %q: %w", s.dir, err)
-	}
-	if d.Version == 0 {
-		d.Version = formatVersion
-	}
-	raw, err := json.MarshalIndent(d, "", "  ")
+// appendLog writes one entry and trims the table to maxLogs rows. The insert
+// and the trim share a transaction so the log never exceeds the cap on disk.
+func (s *Store) appendLog(entry LogEntry) error {
+	tx, err := s.db.Begin()
 	if err != nil {
-		return fmt.Errorf("store: encode: %w", err)
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // rollback after commit is a no-op
+
+	if _, err := tx.Exec(
+		"INSERT INTO logs (ts, level, kind, msg) VALUES (?, ?, ?, ?)",
+		entry.TS, entry.Level, entry.Kind, entry.Msg,
+	); err != nil {
+		return err
+	}
+	// "OFFSET maxLogs" selects the oldest row that is still allowed to
+	// stay; everything at or below it is dropped. Keeping the trim in SQL
+	// avoids loading the whole log into memory on every write.
+	if _, err := tx.Exec(
+		"DELETE FROM logs WHERE id <= "+
+			"(SELECT id FROM logs ORDER BY id DESC LIMIT 1 OFFSET ?)",
+		maxLogs,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// loadOrCreateSettings reads config.json, creating it with default settings
+// when it does not exist yet.
+func (s *Store) loadOrCreateSettings() error {
+	raw, err := os.ReadFile(s.configPath)
+	switch {
+	case err == nil:
+		var settings Settings
+		if err := json.Unmarshal(raw, &settings); err != nil {
+			return fmt.Errorf("store: decode %s: %w", s.configPath, err)
+		}
+		normalizeSettings(&settings)
+		s.settings = settings
+		return nil
+
+	case errors.Is(err, os.ErrNotExist):
+		settings := Settings{Channels: []int{}}
+		if err := s.writeConfig(settings); err != nil {
+			return err
+		}
+		s.settings = settings
+		return nil
+
+	default:
+		return fmt.Errorf("store: read %s: %w", s.configPath, err)
+	}
+}
+
+// writeConfig atomically writes settings to config.json: a temporary file in
+// the same directory is written, fsynced and then renamed over the target.
+func (s *Store) writeConfig(settings Settings) error {
+	raw, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return fmt.Errorf("store: encode settings: %w", err)
 	}
 	raw = append(raw, '\n')
 
-	tmp := filepath.Join(s.dir, tmpFileName)
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	tmp := filepath.Join(s.dir, configTmpName)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
-		return fmt.Errorf("store: create temp file: %w", err)
+		return fmt.Errorf("store: create %s: %w", tmp, err)
 	}
 
 	_, werr := f.Write(raw)
@@ -601,12 +523,12 @@ func (s *Store) writeFile(d storeData) error {
 	}
 	if werr != nil {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("store: write temp file: %w", werr)
+		return fmt.Errorf("store: write %s: %w", tmp, werr)
 	}
 
-	if err := os.Rename(tmp, s.path); err != nil {
+	if err := os.Rename(tmp, s.configPath); err != nil {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("store: replace %s: %w", s.path, err)
+		return fmt.Errorf("store: replace %s: %w", s.configPath, err)
 	}
 
 	// Best-effort directory sync so the rename survives a power loss.
@@ -617,23 +539,30 @@ func (s *Store) writeFile(d storeData) error {
 	return nil
 }
 
-// normalize fills in nil slices so the JSON shape stays stable.
-func (d *storeData) normalize() {
-	if d.Version == 0 {
-		d.Version = formatVersion
+// segmentWhere builds the WHERE clause shared by the count and page queries.
+func segmentWhere(f SegFilter) (string, []any) {
+	conds := make([]string, 0, 4)
+	args := make([]any, 0, 4)
+	if f.Ch > 0 {
+		conds = append(conds, "ch = ?")
+		args = append(args, f.Ch)
 	}
-	if d.Segments == nil {
-		d.Segments = []Segment{}
+	if f.Status != "" {
+		conds = append(conds, "status = ?")
+		args = append(args, f.Status)
 	}
-	if d.Logs == nil {
-		d.Logs = []LogEntry{}
+	if f.From > 0 {
+		conds = append(conds, "end_ts > ?")
+		args = append(args, f.From)
 	}
-	if d.Settings.Channels == nil {
-		d.Settings.Channels = []int{}
+	if f.To > 0 {
+		conds = append(conds, "start_ts < ?")
+		args = append(args, f.To)
 	}
-	if len(d.Logs) > maxLogs {
-		d.Logs = append([]LogEntry(nil), d.Logs[len(d.Logs)-maxLogs:]...)
+	if len(conds) == 0 {
+		return "", args
 	}
+	return " WHERE " + strings.Join(conds, " AND "), args
 }
 
 func cloneSettings(in Settings) Settings {
@@ -649,50 +578,10 @@ func cloneSettings(in Settings) Settings {
 	return out
 }
 
-func sameKey(a, b Segment) bool {
-	return a.Ch == b.Ch && a.Start == b.Start && a.End == b.End
-}
-
-// mergeSegment overlays the non-zero fields of in onto old.
-func mergeSegment(old, in Segment) Segment {
-	out := old
-	if in.Size != 0 {
-		out.Size = in.Size
+// normalizeSettings fills in a nil Channels slice so the JSON shape stays
+// stable across restarts.
+func normalizeSettings(settings *Settings) {
+	if settings.Channels == nil {
+		settings.Channels = []int{}
 	}
-	if in.EventType != 0 {
-		out.EventType = in.EventType
-	}
-	if in.Status != "" {
-		out.Status = in.Status
-		out.Err = in.Err
-	}
-	if in.SyncedAt != 0 {
-		out.SyncedAt = in.SyncedAt
-	}
-	if in.Path != "" {
-		out.Path = in.Path
-	}
-	if in.Bytes != 0 {
-		out.Bytes = in.Bytes
-	}
-	if in.Err != "" {
-		out.Err = in.Err
-	}
-	return out
-}
-
-func segmentMatches(seg Segment, f SegFilter) bool {
-	if f.Ch > 0 && seg.Ch != f.Ch {
-		return false
-	}
-	if f.Status != "" && seg.Status != f.Status {
-		return false
-	}
-	if f.From > 0 && seg.End <= f.From {
-		return false
-	}
-	if f.To > 0 && seg.Start >= f.To {
-		return false
-	}
-	return true
 }
