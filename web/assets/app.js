@@ -911,7 +911,6 @@
       loadStats(view);
       loadSegments(view);
       loadLogs(view);
-      refreshCatalog(view, { quiet: true });
 
       return function cleanup() {
         view.destroyed = true;

@@ -22,7 +22,7 @@ import (
 
 // Version is the release version reported by /api/health and startup logs.
 // It is overridden at build time via -ldflags "-X main.Version=...".
-var Version = "0.1.0"
+var Version = "0.1.1"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {

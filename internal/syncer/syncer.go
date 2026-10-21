@@ -61,6 +61,13 @@ const (
 // ErrAlreadyRunning is returned by Start when a sync is already in flight.
 var ErrAlreadyRunning = errors.New("syncer: sync already running")
 
+// ErrCatalogBusy is returned when a catalogue refresh is already running.
+var ErrCatalogBusy = errors.New("syncer: catalogue refresh already running")
+
+// catalogCooldown coalesces bursts of refresh requests (page loads, multiple
+// tabs, the background loop) into at most one NVR scan per interval.
+const catalogCooldown = 60 * time.Second
+
 // SyncRequest selects what to sync.
 //
 // Channels empty means Settings.Channels. From/To are unix seconds; From=0
@@ -82,6 +89,13 @@ type Syncer struct {
 	running bool
 	cancel  context.CancelFunc
 	done    chan struct{}
+
+	// Catalogue refreshes are expensive (one NVR login + many media list
+	// queries), so concurrent triggers are coalesced and repeats inside
+	// catalogCooldown reuse the previous result.
+	catalogMu   sync.Mutex
+	catalogAt   time.Time
+	catalogLast CatalogResult
 }
 
 // New returns a Syncer backed by st.
@@ -1091,6 +1105,16 @@ func (s *Syncer) CatalogLoop(ctx context.Context) {
 // RefreshCatalog lists the NVR recordings for the configured horizon and
 // reconciles the local index with them. It never downloads footage.
 func (s *Syncer) RefreshCatalog(ctx context.Context) (CatalogResult, error) {
+	if !s.catalogMu.TryLock() {
+		return CatalogResult{}, ErrCatalogBusy
+	}
+	defer s.catalogMu.Unlock()
+	if time.Since(s.catalogAt) < catalogCooldown {
+		return s.catalogLast, nil
+	}
+	// Record the attempt even if it fails, so a failing NVR is not hammered
+	// by page loads either.
+	s.catalogAt = time.Now()
 	var res CatalogResult
 	settings := s.st.Settings()
 	if strings.TrimSpace(settings.NVRHost) == "" {
@@ -1126,6 +1150,10 @@ func (s *Syncer) RefreshCatalog(ctx context.Context) (CatalogResult, error) {
 	for _, ch := range channels {
 		segs, err := mediaListRange(ctx, client, ch, from, to)
 		if err != nil {
+			if nvr.IsBusy(err) {
+				s.st.Log("warn", "catalog", fmt.Sprintf("cam%d NVR 繁忙（-40401），本轮跳过", ch))
+				continue
+			}
 			s.st.Log("error", "catalog", fmt.Sprintf("cam%d 列出录像失败: %v", ch, err))
 			continue
 		}
@@ -1198,6 +1226,7 @@ func (s *Syncer) RefreshCatalog(ctx context.Context) (CatalogResult, error) {
 	}
 	s.st.Log("info", "catalog", fmt.Sprintf("对账完成：NVR 上 %d 段，新增 %d，转为仅本地 %d，标记丢失 %d",
 		res.Listed, res.Added, res.BecameLocal, res.MarkedGone))
+	s.catalogLast = res
 	return res, nil
 }
 

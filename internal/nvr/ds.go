@@ -283,3 +283,10 @@ func parseIntList(b []byte) ([]int64, error) {
 	}
 	return out, nil
 }
+
+// IsBusy reports the device's "too many sessions / busy" reply (-40401). It is
+// transient: the request should be skipped or retried instead of treated as a
+// configuration error.
+func IsBusy(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "error_code=-40401")
+}
