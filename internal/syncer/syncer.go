@@ -1059,6 +1059,14 @@ func mediaListRange(ctx context.Context, client *nvr.Client, ch int, from, to in
 			out = append(out, segs...)
 		}
 		start = next
+		// Be gentle with the NVR: a 30-day, 8-channel refresh is ~240
+		// requests, and firing them back-to-back makes the device answer
+		// -40401 (busy).
+		select {
+		case <-ctx.Done():
+			return out, ctx.Err()
+		case <-time.After(mediaListPace):
+		}
 	}
 	return out, nil
 }
@@ -1066,6 +1074,9 @@ func mediaListRange(ctx context.Context, client *nvr.Client, ch int, from, to in
 // defaultCatalogDays is how far back the automatic catalogue refresh looks
 // when the setting is not positive.
 const defaultCatalogDays = 7
+
+// mediaListPace is the pause between day-sized media list queries.
+const mediaListPace = 150 * time.Millisecond
 
 // catalogPoll is the fallback reconcile interval when the setting is missing.
 const catalogPoll = 5 * time.Minute
