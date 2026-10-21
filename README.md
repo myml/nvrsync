@@ -30,6 +30,16 @@ docker run -d --name nvrsync \
 
 镜像支持 `linux/amd64` 与 `linux/arm64`；`/data` 里是 `config.json`（设置）、`nvrsync.db`（SQLite：录像段/日志/同步状态）和 `rec/`（录像文件）。
 
+NAS（docker compose）：
+
+```bash
+mkdir -p /volume1/docker/nvrsync && cd /volume1/docker/nvrsync
+curl -fsSLO https://raw.githubusercontent.com/myml/nvrsync/main/deploy/docker-compose.yml
+docker compose up -d
+```
+
+> GHCR 包默认可能是私有的：若 `docker pull` 失败，先在 GitHub 的 Package 设置里把 `nvrsync` 改为 public，或在 NAS 上 `docker login ghcr.io`（用带 `read:packages` 的 token）。
+
 ### 本地构建
 
 ```bash

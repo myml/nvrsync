@@ -1,0 +1,12 @@
+# NAS 部署示例：把 data/ 放到大容量盘，容器重启后设置与索引都在。
+services:
+  nvrsync:
+    image: ghcr.io/myml/nvrsync:latest
+    container_name: nvrsync
+    restart: unless-stopped
+    ports:
+      - "8099:8099"
+    volumes:
+      - ./data:/data
+    environment:
+      - TZ=Asia/Shanghai
