@@ -865,7 +865,7 @@
 
       refreshBtn.addEventListener('click', function () {
         withBusy(refreshBtn, function () {
-          return refreshCatalog(view, { force: true, quiet: true }).then(function () {
+          return refreshCatalog(view, { force: true, loud: true, quiet: true }).then(function () {
             return Promise.all([loadStats(view), loadSegments(view), loadLogs(view)]);
           });
         });
@@ -927,6 +927,10 @@
   async function refreshCatalog(view, opts) {
     var force = !!(opts && opts.force);
     var res = await api('/api/catalog/refresh' + (force ? '?force=1' : ''), { method: 'POST', quiet: true });
+    if (res.ok && res.data && res.data.skipped) {
+      if (opts && opts.loud) toast('对账正在进行，本次已跳过', 'info');
+      return res;
+    }
     if (res.ok && !view.destroyed) {
       if (opts && opts.loud) {
         toast('对账完成：新增 ' + res.data.added + '，仅本地 ' + res.data.became_local + '，丢失 ' + res.data.marked_gone, 'ok');

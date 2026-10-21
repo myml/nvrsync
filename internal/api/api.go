@@ -275,10 +275,17 @@ func (s *server) handleCatalogRefresh(w http.ResponseWriter, r *http.Request) {
 	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
 	res, err := s.sy.RefreshCatalogForce(ctx, force)
 	if err != nil {
-		status := http.StatusBadGateway
-		if errors.Is(err, syncer.ErrAlreadyRunning) {
-			status = http.StatusConflict
+		// A refresh that is already in flight is not an error: the caller
+		// simply skips this round.
+		if errors.Is(err, syncer.ErrCatalogBusy) {
+			writeOK(w, http.StatusOK, map[string]any{"skipped": true, "reason": "对账进行中"})
+			return
 		}
+		if errors.Is(err, syncer.ErrAlreadyRunning) {
+			writeOK(w, http.StatusOK, map[string]any{"skipped": true, "reason": "同步进行中"})
+			return
+		}
+		status := http.StatusBadGateway
 		writeError(w, status, err.Error())
 		return
 	}
