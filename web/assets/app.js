@@ -865,7 +865,7 @@
 
       refreshBtn.addEventListener('click', function () {
         withBusy(refreshBtn, function () {
-          return refreshCatalog(view, { quiet: true }).then(function () {
+          return refreshCatalog(view, { force: true, quiet: true }).then(function () {
             return Promise.all([loadStats(view), loadSegments(view), loadLogs(view)]);
           });
         });
@@ -925,7 +925,8 @@
 
   /** 后台对账：把 NVR 当前持有的录像同步进本地索引（只列不下载）。 */
   async function refreshCatalog(view, opts) {
-    var res = await api('/api/catalog/refresh', { method: 'POST', quiet: true });
+    var force = !!(opts && opts.force);
+    var res = await api('/api/catalog/refresh' + (force ? '?force=1' : ''), { method: 'POST', quiet: true });
     if (res.ok && !view.destroyed) {
       if (opts && opts.loud) {
         toast('对账完成：新增 ' + res.data.added + '，仅本地 ' + res.data.became_local + '，丢失 ' + res.data.marked_gone, 'ok');

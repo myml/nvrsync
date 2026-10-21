@@ -1116,11 +1116,17 @@ func (s *Syncer) CatalogLoop(ctx context.Context) {
 // RefreshCatalog lists the NVR recordings for the configured horizon and
 // reconciles the local index with them. It never downloads footage.
 func (s *Syncer) RefreshCatalog(ctx context.Context) (CatalogResult, error) {
+	return s.RefreshCatalogForce(ctx, false)
+}
+
+// RefreshCatalogForce is RefreshCatalog with an option to bypass the cooldown.
+// It is used by the UI refresh button, which must always hit the NVR.
+func (s *Syncer) RefreshCatalogForce(ctx context.Context, force bool) (CatalogResult, error) {
 	if !s.catalogMu.TryLock() {
 		return CatalogResult{}, ErrCatalogBusy
 	}
 	defer s.catalogMu.Unlock()
-	if time.Since(s.catalogAt) < catalogCooldown {
+	if !force && time.Since(s.catalogAt) < catalogCooldown {
 		return s.catalogLast, nil
 	}
 	// Record the attempt even if it fails, so a failing NVR is not hammered

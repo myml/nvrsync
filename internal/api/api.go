@@ -272,7 +272,8 @@ func (s *server) handleDays(w http.ResponseWriter, r *http.Request) {
 func (s *server) handleCatalogRefresh(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 180*time.Second)
 	defer cancel()
-	res, err := s.sy.RefreshCatalog(ctx)
+	force := r.URL.Query().Get("force") == "1" || r.URL.Query().Get("force") == "true"
+	res, err := s.sy.RefreshCatalogForce(ctx, force)
 	if err != nil {
 		status := http.StatusBadGateway
 		if errors.Is(err, syncer.ErrAlreadyRunning) {
