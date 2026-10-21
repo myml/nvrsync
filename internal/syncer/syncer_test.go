@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/myml/nvrsync/internal/nvr"
 	"github.com/myml/nvrsync/internal/store"
 )
 
@@ -496,5 +497,23 @@ func TestCutoffExcludesPendingSegments(t *testing.T) {
 	}
 	if queue[0].End != yesterday.End {
 		t.Errorf("queued %+v, want only yesterday's segment", queue[0])
+	}
+}
+
+func TestDropCoveredClips(t *testing.T) {
+	segs := []nvr.MediaSeg{
+		{Start: 0, End: 3600, EventType: 1},
+		{Start: 100, End: 110, EventType: 2},   // inside continuous
+		{Start: 4000, End: 4010, EventType: 2}, // outside continuous
+		{Start: 0, End: 3600, EventType: 21},   // composite event is kept
+	}
+	got := dropCoveredClips(segs)
+	if len(got) != 3 {
+		t.Fatalf("got %d segments, want 3: %+v", len(got), got)
+	}
+	for _, seg := range got {
+		if seg.EventType == 2 && seg.Start == 100 {
+			t.Errorf("covered motion clip was not dropped")
+		}
 	}
 }

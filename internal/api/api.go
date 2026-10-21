@@ -2,6 +2,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -72,6 +73,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /api/settings", s.handleGetSettings)
 	mux.HandleFunc("PUT /api/settings", s.handlePutSettings)
 	mux.HandleFunc("POST /api/nvr/test", s.handleNVRTest)
+	mux.HandleFunc("POST /api/nvr/scan", s.handleNVRScan)
 
 	mux.HandleFunc("GET /api/segments", s.handleSegments)
 
@@ -264,6 +266,28 @@ func (s *server) handleDays(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- sync -------------------------------------------------------------------
+
+// handleNVRScan lists NVR recordings for a range without downloading them, so
+// the sync page can browse any day before deciding what to pull.
+func (s *server) handleNVRScan(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Channels []int `json:"channels"`
+		From     int64 `json:"from"`
+		To       int64 `json:"to"`
+	}
+	if err := decodeJSON(w, r, &req, true); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid scan request: "+err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	listed, added, err := s.sy.ScanOnly(ctx, req.Channels, req.From, req.To)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeOK(w, http.StatusOK, map[string]any{"listed": listed, "added": added})
+}
 
 func (s *server) handleSyncStart(w http.ResponseWriter, r *http.Request) {
 	var req syncer.SyncRequest

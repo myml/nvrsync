@@ -759,6 +759,7 @@
       statusSelect.value = f.status || '';
 
       var refreshBtn = button('刷新', { icon: 'refresh', id: 'sync-refresh' });
+      var listBtn = button('列出 NVR 录像', { icon: 'database', id: 'sync-list' });
       var stopBtn = button('停止', { icon: 'stop', id: 'sync-stop', hidden: true });
       var startBtn = button('开始同步', { icon: 'play', variant: 'btn-primary', id: 'sync-start' });
 
@@ -767,7 +768,7 @@
         field('从', fromInput, { id: 'sync-from' }),
         field('到', toInput, { id: 'sync-to' }),
         field('状态', statusSelect, { id: 'sync-status' }),
-        el('div', { class: 'toolbar-actions' }, [refreshBtn, stopBtn, startBtn])
+        el('div', { class: 'toolbar-actions' }, [listBtn, refreshBtn, stopBtn, startBtn])
       ]);
 
       /* ---- 进度条（同步中显示） ---- */
@@ -824,6 +825,7 @@
       view.startBtn = startBtn;
       view.stopBtn = stopBtn;
       view.refreshBtn = refreshBtn;
+      view.listBtn = listBtn;
 
       syncLogsOpen(view);
 
@@ -839,18 +841,26 @@
         f.from = fromInput.value;
         f.page = 1;
         loadSegments(view);
+        refreshFromNVR(view);
       });
 
       toInput.addEventListener('change', function () {
         f.to = toInput.value;
         f.page = 1;
         loadSegments(view);
+        refreshFromNVR(view);
       });
 
       statusSelect.addEventListener('change', function () {
         f.status = statusSelect.value;
         f.page = 1;
         loadSegments(view);
+      });
+
+      listBtn.addEventListener('click', function () {
+        withBusy(listBtn, function () {
+          return refreshFromNVR(view, { loud: true });
+        });
       });
 
       refreshBtn.addEventListener('click', function () {
@@ -910,6 +920,34 @@
       };
     }
   };
+
+  /** 让当前筛选范围对应的 NVR 录像出现在列表里（只列不下载）。 */
+  async function refreshFromNVR(view, opts) {
+    var f = state.filters;
+    var today = dayBounds(isoDate(new Date()));
+    var from = f.from ? dayBounds(f.from).from : (today ? today.from : 0);
+    var to = f.to ? dayBounds(f.to).to : Math.floor(Date.now() / 1000);
+    if (!from || !to) return { ok: false };
+    var channels = f.ch ? [f.ch] : channelsFromSettings(state.settings);
+    if (!channels.length) return { ok: false };
+    var res = await api('/api/nvr/scan', {
+      method: 'POST',
+      body: { channels: channels, from: from, to: to },
+      quiet: true
+    });
+    if (res.ok) {
+      if (opts && opts.loud) {
+        toast('已列出 ' + res.data.listed + ' 段，新增 ' + res.data.added + ' 段', 'ok');
+      }
+      if (!view.destroyed) {
+        loadSegments(view);
+        loadStats(view);
+      }
+    } else if (opts && opts.loud) {
+      toast(res.error || '列出 NVR 录像失败', 'error');
+    }
+    return res;
+  }
 
   function syncLogsOpen(view) {
     view.logsCard.classList.toggle('is-collapsed', !state.logs.open);
@@ -1369,6 +1407,12 @@
         ch = toInt(chSelect.value, channels[0]);
         state.recordings.ch = ch;
         load();
+      });
+
+      listBtn.addEventListener('click', function () {
+        withBusy(listBtn, function () {
+          return refreshFromNVR(view, { loud: true });
+        });
       });
 
       refreshBtn.addEventListener('click', function () {
@@ -1989,6 +2033,12 @@
         view.ctx = { segments: all, done: done, media: media };
         setupPlayer();
       }
+
+      listBtn.addEventListener('click', function () {
+        withBusy(listBtn, function () {
+          return refreshFromNVR(view, { loud: true });
+        });
+      });
 
       refreshBtn.addEventListener('click', function () {
         withBusy(refreshBtn, function () { return load(); });

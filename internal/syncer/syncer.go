@@ -389,16 +389,17 @@ func (s *Syncer) scan(ctx context.Context, client *nvr.Client, settings store.Se
 		}
 		s.st.Log("info", "scan", fmt.Sprintf("扫描 cam%d：%s ~ %s", ch, fmtTS(from), fmtTS(to)))
 
-		segs, err := client.MediaListContext(ctx, ch, from, to)
-		if errors.Is(err, nvr.ErrNoMedia) {
-			s.st.Log("info", "scan", fmt.Sprintf("cam%d 该时段无录像（-71104）", ch))
-			continue
-		}
+		segs, err := mediaListRange(ctx, client, ch, from, to)
 		if err != nil {
 			p.setError(err)
 			s.st.Log("error", "scan", fmt.Sprintf("cam%d 列出录像失败: %v", ch, err))
 			continue
 		}
+		if len(segs) == 0 {
+			s.st.Log("info", "scan", fmt.Sprintf("cam%d 该时段无录像", ch))
+			continue
+		}
+		segs = dropCoveredClips(segs)
 
 		doneKeys := map[segKey]bool{}
 		if !req.Force {
@@ -903,4 +904,137 @@ func humanBytes(n int64) string {
 		return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
 	}
 	return fmt.Sprintf("%.2f GiB", float64(n)/(1<<30))
+}
+
+// ScanOnly lists NVR recordings for the given range and records them in the
+// store without downloading anything. Segments newer than the configured
+// cutoff are stored as "skipped" so they neither queue nor appear as pending;
+// they can be listed again once the cutoff has moved past them.
+func (s *Syncer) ScanOnly(ctx context.Context, channels []int, from, to int64) (listed, added int, err error) {
+	settings := s.st.Settings()
+	if strings.TrimSpace(settings.NVRHost) == "" {
+		return 0, 0, errors.New("nvr_host 未配置")
+	}
+	if len(channels) == 0 {
+		channels = settings.Channels
+	}
+	if len(channels) == 0 {
+		channels = []int{1}
+	}
+	now := time.Now()
+	if to <= 0 {
+		to = now.Unix()
+	}
+	if from <= 0 {
+		from = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local).Unix()
+	}
+	if from >= to {
+		return 0, 0, errors.New("from 必须早于 to")
+	}
+	cutoff := syncCutoff(settings, now.Unix())
+
+	client := nvr.New(settings.NVRHost, settings.NVRUser, settings.NVRPass, settings.AdminPort)
+	if err := client.Login(); err != nil {
+		return 0, 0, fmt.Errorf("登录 NVR 失败: %w", err)
+	}
+
+	for _, ch := range channels {
+		segs, err := mediaListRange(ctx, client, ch, from, to)
+		if err != nil {
+			return listed, added, fmt.Errorf("cam%d 列出录像失败: %w", ch, err)
+		}
+		segs = dropCoveredClips(segs)
+		known := map[segKey]bool{}
+		for _, status := range []string{"pending", "syncing", "done", "failed", "skipped"} {
+			for _, old := range s.listChannel(ch, status) {
+				known[segKey{old.Ch, old.Start, old.End}] = true
+			}
+		}
+		for _, ms := range segs {
+			listed++
+			key := segKey{ch, ms.Start, ms.End}
+			if known[key] {
+				continue
+			}
+			seg := store.Segment{Ch: ch, Start: ms.Start, End: ms.End, Size: ms.Size, EventType: ms.EventType}
+			switch {
+			case seg.End <= seg.Start:
+				seg.Status = "skipped"
+				seg.Err = "empty time range"
+			case seg.End > cutoff:
+				seg.Status = "skipped"
+				seg.Err = "晚于同步截止时间，暂不同步"
+			default:
+				seg.Status = "pending"
+			}
+			if err := s.st.UpsertSegment(seg); err != nil {
+				continue
+			}
+			known[key] = true
+			added++
+		}
+	}
+	s.st.Log("info", "scan", fmt.Sprintf("列出 NVR 录像 %s ~ %s：%d 段，新增 %d 段",
+		fmtTS(from), fmtTS(to), listed, added))
+	return listed, added, nil
+}
+
+// dropCoveredClips removes motion clips (event type 2) that lie entirely inside
+// a continuous recording (event type 1) returned for the same range. Keeping
+// them would double both the download volume and the timeline entries.
+func dropCoveredClips(segs []nvr.MediaSeg) []nvr.MediaSeg {
+	continuous := make([]nvr.MediaSeg, 0, len(segs))
+	for _, s := range segs {
+		if s.EventType == 1 {
+			continuous = append(continuous, s)
+		}
+	}
+	if len(continuous) == 0 {
+		return segs
+	}
+	out := segs[:0]
+	for _, s := range segs {
+		if s.EventType == 2 {
+			covered := false
+			for _, c := range continuous {
+				if c.Start <= s.Start && c.End >= s.End {
+					covered = true
+					break
+				}
+			}
+			if covered {
+				continue
+			}
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// mediaListRange lists recordings for an arbitrary range by querying the NVR
+// one local day at a time: a single wide query silently under-reports on this
+// firmware once it spans several days.
+func mediaListRange(ctx context.Context, client *nvr.Client, ch int, from, to int64) ([]nvr.MediaSeg, error) {
+	var out []nvr.MediaSeg
+	for start := from; start < to; {
+		day := time.Unix(start, 0).In(time.Local)
+		next := time.Date(day.Year(), day.Month(), day.Day(), 0, 0, 0, 0, time.Local).AddDate(0, 0, 1).Unix()
+		if next <= start {
+			next = start + 86400
+		}
+		if next > to {
+			next = to
+		}
+		segs, err := client.MediaListContext(ctx, ch, start, next)
+		switch {
+		case errors.Is(err, nvr.ErrNoMedia):
+			// no recording in this slice
+		case err != nil:
+			return out, err
+		default:
+			out = append(out, segs...)
+		}
+		start = next
+	}
+	return out, nil
 }

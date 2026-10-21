@@ -93,6 +93,7 @@ func (p *Player) EnsureProxy(ch int, date string) error           // 可选 ffmp
 | GET | `/api/health` | `{ok,version}` |
 | GET/PUT | `/api/settings` | 读/写设置；PUT 后立即生效 |
 | POST | `/api/nvr/test` | 用当前设置登录+列一段，返回 ok/错误 |
+| POST | `/api/nvr/scan` | `{channels,from,to}` 只列出 NVR 录像写入本地索引（不下载），超过截止时间的段标为 skipped |
 | GET | `/api/segments?ch=&from=&to=&status=&limit=&offset=` | 列表 + total |
 | POST | `/api/sync/start` | `{channels,from,to,force}`（from/to 可省略=自动） |
 | POST | `/api/sync/stop` | |
