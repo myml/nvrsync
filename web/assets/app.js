@@ -715,6 +715,8 @@
       if (!state.filters) state.filters = defaultFilters();
       var f = state.filters;
       if (!f.limit) f.limit = PAGE_SIZE;
+      // 设置里的通道列表可能在本次会话中被修改过，丢弃已不存在的筛选通道。
+      if (f.ch && availableChannels().indexOf(f.ch) < 0) f.ch = 0;
 
       /* ---- 统计卡 ---- */
       var statDefs = [
@@ -1661,53 +1663,63 @@
         var HlsCtor = window.Hls;
 
         if (HlsCtor && typeof HlsCtor.isSupported === 'function' && HlsCtor.isSupported()) {
-          var hls = new HlsCtor({
-            enableWorker: true,
-            lowLatencyMode: false,
-            backBufferLength: 90
-          });
-          view.hls = hls;
-          var netRetries = 0;
-          var mediaRetries = 0;
+          try {
+            var hls = new HlsCtor({
+              enableWorker: true,
+              lowLatencyMode: false,
+              backBufferLength: 90
+            });
+            view.hls = hls;
+            var netRetries = 0;
+            var mediaRetries = 0;
 
-          hls.on(HlsCtor.Events.MEDIA_ATTACHED, function () {
-            if (view.destroyed) return;
-            hls.loadSource(src);
-          });
+            hls.on(HlsCtor.Events.MEDIA_ATTACHED, function () {
+              if (view.destroyed) return;
+              hls.loadSource(src);
+            });
 
-          hls.on(HlsCtor.Events.MANIFEST_PARSED, function () {
-            if (view.destroyed) return;
-            hideOverlay();
-            playhead.hidden = false;
-          });
+            hls.on(HlsCtor.Events.MANIFEST_PARSED, function () {
+              if (view.destroyed) return;
+              hideOverlay();
+              playhead.hidden = false;
+            });
 
-          hls.on(HlsCtor.Events.ERROR, function (event, data) {
-            if (view.destroyed || !data) return;
-            if (!data.fatal) return;
+            hls.on(HlsCtor.Events.ERROR, function (event, data) {
+              if (view.destroyed || !data) return;
+              if (!data.fatal) return;
 
-            // 先给一次自愈机会，再展示错误与 HEVC 提示。
-            if (data.type === HlsCtor.ErrorTypes.NETWORK_ERROR && netRetries < 1) {
-              netRetries++;
-              hls.startLoad();
-              return;
-            }
-            if (data.type === HlsCtor.ErrorTypes.MEDIA_ERROR && mediaRetries < 1) {
-              mediaRetries++;
-              hls.recoverMediaError();
-              return;
-            }
+              // 先给一次自愈机会，再展示错误与 HEVC 提示。
+              if (data.type === HlsCtor.ErrorTypes.NETWORK_ERROR && netRetries < 1) {
+                netRetries++;
+                hls.startLoad();
+                return;
+              }
+              if (data.type === HlsCtor.ErrorTypes.MEDIA_ERROR && mediaRetries < 1) {
+                mediaRetries++;
+                hls.recoverMediaError();
+                return;
+              }
 
-            var detail = data.details || data.reason || '';
-            showPlaybackError(
-              '无法播放这段录像',
-              '浏览器可能不支持 HEVC/H.265 编码，或者该段录像文件不完整。' +
-              '建议用 VLC 等支持 HEVC 的播放器打开下方播放列表地址。',
-              String(detail)
-            );
+              var detail = data.details || data.reason || '';
+              showPlaybackError(
+                '无法播放这段录像',
+                '浏览器可能不支持 HEVC/H.265 编码，或者该段录像文件不完整。' +
+                '建议用 VLC 等支持 HEVC 的播放器打开下方播放列表地址。',
+                String(detail)
+              );
+              destroyHls();
+            });
+
+            hls.attachMedia(video);
+          } catch (err) {
+            console.error(err);
             destroyHls();
-          });
-
-          hls.attachMedia(video);
+            showPlaybackError(
+              '播放器初始化失败',
+              'hls.js 无法初始化。请刷新页面重试，或直接用 VLC 打开下方播放列表地址。',
+              err && err.message ? String(err.message) : ''
+            );
+          }
           return;
         }
 
@@ -2239,8 +2251,17 @@
     ]);
 
     var hint = el('span', { class: 'save-hint', text: '所有修改已保存' });
-    var testBtn = button('测试连接', { icon: 'server', id: 'set-test' });
-    var saveBtn = button('保存', { icon: 'check', variant: 'btn-primary', id: 'set-save' });
+    var testBtn = button('测试连接', {
+      icon: 'server',
+      id: 'set-test',
+      title: '使用已保存的设置登录 NVR 并读取一段录像'
+    });
+    var saveBtn = button('保存', {
+      icon: 'check',
+      variant: 'btn-primary',
+      id: 'set-save',
+      title: '保存设置（立即生效）'
+    });
 
     var actions = el('div', { class: 'form-actions' }, [
       hint,
@@ -2362,7 +2383,6 @@
     if (settings.auto_minutes < 0) return '自动同步间隔不能为负数';
     if (settings.backfill_hours < 0) return '回填小时数不能为负数';
     if (settings.retention_days < 0) return '保留天数不能为负数';
-    if (!settings.channels.length) return '请至少勾选一个同步通道';
     return '';
   }
 
@@ -2438,6 +2458,18 @@
   window.addEventListener('hashchange', function () {
     if (booted) route();
   });
+
+  // 跳转链接 (#app) 不能交给 hash 路由，否则会被当成一次页面切换。
+  var skipLink = document.querySelector('.skip-link');
+  if (skipLink) {
+    skipLink.addEventListener('click', function (event) {
+      var app = document.getElementById('app');
+      if (!app) return;
+      event.preventDefault();
+      app.focus();
+      try { app.scrollIntoView({ block: 'start' }); } catch (err) { /* ignore */ }
+    });
+  }
 
   /* ========================================================================
      10. 启动

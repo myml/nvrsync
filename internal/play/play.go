@@ -92,6 +92,11 @@ func (p *Player) DayPlaylist(ch int, date string) ([]byte, error) {
 		return segments[i].Start < segments[j].Start
 	})
 
+	// Event (motion) clips can be fully contained in a longer continuous
+	// recording of the same period. Keeping both would replay the same wall
+	// clock time twice, so shorter segments already covered are dropped.
+	segments = dropContained(segments)
+
 	var maxDuration int64
 	for _, seg := range segments {
 		if d := seg.End - seg.Start; d > maxDuration {
@@ -148,6 +153,34 @@ func (p *Player) EnsureProxy(ch int, date string) error {
 // handler validates every component again before touching the filesystem.
 func mediaURL(ch int, date, file string) string {
 	return "/media/cam" + strconv.Itoa(ch) + "/" + date + "/" + url.PathEscape(file)
+}
+
+// dropContained removes segments whose whole [Start,End) range is already
+// covered by another segment in the list (typically motion clips inside a
+// longer continuous recording). Input must be sorted by Start; the result keeps
+// that order.
+func dropContained(in []store.Segment) []store.Segment {
+	if len(in) < 2 {
+		return in
+	}
+	out := make([]store.Segment, 0, len(in))
+	for i, seg := range in {
+		contained := false
+		for j, other := range in {
+			if i == j {
+				continue
+			}
+			if other.Start <= seg.Start && other.End >= seg.End &&
+				(other.Start < seg.Start || other.End > seg.End || j < i) {
+				contained = true
+				break
+			}
+		}
+		if !contained {
+			out = append(out, seg)
+		}
+	}
+	return out
 }
 
 // segmentFile derives the on-disk file name from the segment path recorded by
