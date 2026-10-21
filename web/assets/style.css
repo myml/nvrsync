@@ -2231,3 +2231,17 @@ input[type="date"]::-webkit-calendar-picker-indicator {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* --------------------------------------------------------------------------
+   app.js 运行时补充：时间轴提示需要溢出时间轴容器
+   （.timeline 原本 overflow:hidden 会把 .timeline-tip 裁掉）
+   -------------------------------------------------------------------------- */
+
+.timeline {
+  overflow: visible;
+}
+
+.timeline-track {
+  overflow: hidden;
+  border-radius: 9px;
+}
