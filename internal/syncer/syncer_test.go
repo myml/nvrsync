@@ -162,7 +162,7 @@ func (f *fakeNVR) adminPort() int {
 
 func TestSyncDownloadsSegments(t *testing.T) {
 	now := time.Now().Unix()
-	f := newFakeNVR(t, [][2]int64{{now - 180, now - 120}, {now - 120, now - 60}})
+	f := newFakeNVR(t, [][2]int64{{now - 900, now - 780}, {now - 780, now - 660}})
 	dataDir := t.TempDir()
 	st, err := store.Open(dataDir)
 	if err != nil {
@@ -318,7 +318,7 @@ func TestRetentionOnlyDeletesDoneInsideStorage(t *testing.T) {
 
 func TestStopCancelsStalledDownload(t *testing.T) {
 	now := time.Now().Unix()
-	f := newFakeNVRBase(t, [][2]int64{{now - 60, now}})
+	f := newFakeNVRBase(t, [][2]int64{{now - 600, now - 300}})
 	// Replace the stream handler behavior: accept and then never answer the
 	// authenticated request. Stop must not wait for the 15s handshake
 	// deadline.
@@ -418,4 +418,33 @@ func waitDone(t *testing.T, s *Syncer, st *store.Store, want int) {
 
 func segKeyString(seg store.Segment) string {
 	return fmt.Sprintf("cam%d@%d-%d", seg.Ch, seg.Start, seg.End)
+}
+
+func TestLiveSegmentsStayPending(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	now := time.Now().Unix()
+	segs := []store.Segment{
+		{Ch: 1, Start: now - 3600, End: now - 10, Status: "pending"},  // may still be recording
+		{Ch: 1, Start: now - 7200, End: now - 600, Status: "pending"}, // safely closed
+	}
+	for _, seg := range segs {
+		if err := st.UpsertSegment(seg); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+	}
+
+	s := New(st)
+	queue := s.collectQueue([]int{1})
+	if len(queue) != 1 {
+		t.Fatalf("expected only the closed segment in queue, got %d: %+v", len(queue), queue)
+	}
+	if queue[0].End != now-600 {
+		t.Errorf("wrong segment queued: %+v", queue[0])
+	}
+	if !isLive(segs[0], now) || isLive(segs[1], now) {
+		t.Errorf("isLive classified segments incorrectly")
+	}
 }

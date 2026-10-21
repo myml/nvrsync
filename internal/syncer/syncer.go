@@ -51,6 +51,11 @@ const (
 	// the first sync is not a no-op.
 	defaultBackfillH = 24
 	pageSize         = 5000
+	// liveGuard leaves the newest recordings alone for a couple of minutes:
+	// a segment that ends too close to "now" may still be recording, and
+	// downloading it now would persist a truncated file whose tail the
+	// watermark then skips forever.
+	liveGuard = 120 // seconds
 )
 
 // ErrAlreadyRunning is returned by Start when a sync is already in flight.
@@ -461,6 +466,12 @@ func (s *Syncer) collectQueue(channels []int) []store.Segment {
 					_ = s.st.UpsertSegment(seg)
 					continue
 				}
+				if isLive(seg, time.Now().Unix()) {
+					// Still recording: keep it pending and retry next round
+					// instead of persisting a truncated file.
+					s.st.Log("info", "download", fmt.Sprintf("cam%d %s 仍在写入，稍后再同步", seg.Ch, segTime(seg)))
+					continue
+				}
 				queue = append(queue, seg)
 			}
 		}
@@ -843,6 +854,13 @@ func fmtTS(unix int64) string {
 func segTime(seg store.Segment) string {
 	return time.Unix(seg.Start, 0).In(time.Local).Format("01-02 15:04:05") + " - " +
 		time.Unix(seg.End, 0).In(time.Local).Format("15:04:05")
+}
+
+// isLive reports whether a segment may still be recording, i.e. its end is
+// within liveGuard seconds of now. Such segments are left for a later round so
+// a partially written file is never stored as complete.
+func isLive(seg store.Segment, now int64) bool {
+	return seg.End > now-liveGuard
 }
 
 func humanBytes(n int64) string {
