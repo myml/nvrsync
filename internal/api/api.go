@@ -183,8 +183,6 @@ func validateSettings(v store.Settings) error {
 		return fmt.Errorf("admin_port must be between 0 and 65535")
 	case v.AutoMinutes < 0:
 		return fmt.Errorf("auto_minutes must not be negative")
-	case v.BackfillH < 0:
-		return fmt.Errorf("backfill_hours must not be negative")
 	case v.RetentionD < 0:
 		return fmt.Errorf("retention_days must not be negative")
 	}

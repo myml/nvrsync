@@ -162,9 +162,6 @@ func TestOpenInitializes(t *testing.T) {
 	if days := s.Days(0); len(days) != 0 || days == nil {
 		t.Errorf("Days() = %v, want empty non-nil", days)
 	}
-	if got := s.MaxSyncedEnd(0); got != 0 {
-		t.Errorf("MaxSyncedEnd() = %d, want 0", got)
-	}
 	if got := s.SyncState(); got != (SyncState{}) {
 		t.Errorf("SyncState() = %+v, want zero", got)
 	}
@@ -299,7 +296,6 @@ func TestSettingsPersistAndCopy(t *testing.T) {
 		StorageDir:      "/srv/rec",
 		Channels:        []int{1, 2},
 		AutoMinutes:     15,
-		BackfillH:       24,
 		RetentionD:      7,
 		Transcode:       true,
 		FFmpeg:          "/usr/bin/ffmpeg",
@@ -513,31 +509,15 @@ func TestUpsertSegmentMergesNonZeroFields(t *testing.T) {
 	}
 }
 
-func TestDeleteAndMaxSyncedEnd(t *testing.T) {
+func TestDeleteSegment(t *testing.T) {
 	dir := t.TempDir()
 	s := openStoreAt(t, dir)
 	for _, seg := range []Segment{
 		{Ch: 1, Start: 100, End: 200, Status: "done"},
 		{Ch: 1, Start: 300, End: 400, Status: "done"},
-		{Ch: 1, Start: 500, End: 900, Status: "pending"},
-		{Ch: 1, Start: 900, End: 1000, Status: "local_only"},
 		{Ch: 2, Start: 700, End: 800, Status: "done"},
 	} {
 		mustUpsert(t, s, seg)
-	}
-
-	// local_only footage still exists on disk and must hold the watermark.
-	if got := s.MaxSyncedEnd(1); got != 1000 {
-		t.Errorf("MaxSyncedEnd(1) = %d, want 1000", got)
-	}
-	if got := s.MaxSyncedEnd(2); got != 800 {
-		t.Errorf("MaxSyncedEnd(2) = %d, want 800", got)
-	}
-	if got := s.MaxSyncedEnd(0); got != 1000 {
-		t.Errorf("MaxSyncedEnd(0) = %d, want 1000", got)
-	}
-	if got := s.MaxSyncedEnd(9); got != 0 {
-		t.Errorf("MaxSyncedEnd(9) = %d, want 0", got)
 	}
 
 	if err := s.DeleteSegment(9, 1, 2); err != nil {
@@ -546,19 +526,12 @@ func TestDeleteAndMaxSyncedEnd(t *testing.T) {
 	if err := s.DeleteSegment(1, 100, 200); err != nil {
 		t.Fatalf("DeleteSegment: %v", err)
 	}
-	if got := s.MaxSyncedEnd(1); got != 1000 {
-		t.Errorf("MaxSyncedEnd(1) after delete = %d, want 1000", got)
+	if _, total := s.Segments(SegFilter{}); total != 2 {
+		t.Errorf("total after delete = %d, want 2", total)
 	}
-	if _, total := s.Segments(SegFilter{}); total != 4 {
-		t.Errorf("total after delete = %d, want 4", total)
-	}
-
 	reopened := openStoreAt(t, dir)
-	if _, total := reopened.Segments(SegFilter{}); total != 4 {
-		t.Errorf("reopened total after delete = %d, want 4", total)
-	}
-	if got := reopened.MaxSyncedEnd(1); got != 1000 {
-		t.Errorf("reopened MaxSyncedEnd(1) = %d, want 1000", got)
+	if _, total := reopened.Segments(SegFilter{}); total != 2 {
+		t.Errorf("reopened total after delete = %d, want 2", total)
 	}
 }
 
@@ -786,7 +759,6 @@ func TestConcurrentAccess(t *testing.T) {
 				s.Segments(SegFilter{Ch: 1})
 				s.Logs(10, "info")
 				s.Days(1)
-				s.MaxSyncedEnd(1)
 				_ = s.SyncState()
 			}
 		}(w)

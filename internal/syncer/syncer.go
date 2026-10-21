@@ -47,10 +47,7 @@ const (
 	// autoPoll is how often AutoLoop re-reads settings, so changing
 	// AutoMinutes takes effect without restarting the process.
 	autoPoll = 15 * time.Second
-	// defaultBackfillH is used when Settings.BackfillH is not positive, so
-	// the first sync is not a no-op.
-	defaultBackfillH = 24
-	pageSize         = 5000
+	pageSize = 5000
 	// liveGuard leaves the newest recordings alone for a couple of minutes:
 	// a segment that ends too close to "now" may still be recording, and
 	// downloading it now would persist a truncated file whose tail the
@@ -68,17 +65,15 @@ var ErrCatalogBusy = errors.New("syncer: catalogue refresh already running")
 // tabs, the background loop) into at most one NVR scan per interval.
 const catalogCooldown = 60 * time.Second
 
-// SyncRequest selects what to sync.
+// SyncRequest selects which channels and which time range a sync drains from
+// the local index. Zero From/To means "everything pending".
 //
-// Channels empty means Settings.Channels. From/To are unix seconds; From=0
-// means "from the per-channel synced watermark" (or now-BackfillH on the
-// first run) and To=0 means "now". Force re-downloads segments the NVR
-// returns even if they are already done.
+// Channels empty means Settings.Channels. From/To are unix seconds filtering
+// which segments start inside the range; zero means "no bound".
 type SyncRequest struct {
 	Channels []int `json:"channels"`
 	From     int64 `json:"from"`
 	To       int64 `json:"to"`
-	Force    bool  `json:"force"`
 }
 
 // Syncer owns the sync lifecycle. It is safe for concurrent use.
@@ -317,20 +312,9 @@ func (s *Syncer) run(ctx context.Context, req SyncRequest, done chan struct{}) {
 	}
 	s.st.Log("info", "scan", "NVR 登录成功")
 
-	if req.From == 0 && req.To == 0 && settings.CatalogDays > 0 {
-		// The catalogue loop keeps the index fresh, so a plain "sync now" only
-		// has to drain pending segments instead of scanning the NVR again.
-		// Reconciliation timing is the background loop's business (it follows
-		// Settings.CatalogMinutes). A sync only drains what the index already
-		// knows about.
-		s.st.Log("info", "scan", "使用本地索引（对账由后台按设置执行）")
-	} else {
-		s.scan(ctx, client, settings, req, p)
-	}
-	if ctx.Err() != nil {
-		s.st.Log("warn", "scan", "同步已取消")
-		return
-	}
+	// Discovery belongs to the catalogue loop; a sync only drains what the
+	// local index already knows about.
+	s.st.Log("info", "scan", "使用本地索引（对账由后台按设置执行）")
 
 	queue := s.collectQueue(req.Channels, req.From, req.To)
 	p.setTotal(len(queue))
@@ -368,9 +352,6 @@ func describeRange(req SyncRequest) string {
 	if req.To > 0 {
 		to = fmtTS(req.To)
 	}
-	if req.Force {
-		return from + " ~ " + to + "（force）"
-	}
 	return from + " ~ " + to
 }
 
@@ -378,97 +359,12 @@ func (s *Syncer) publish(p *progress, running bool) {
 	s.st.SetSyncState(p.state(running))
 }
 
-// scan lists NVR segments for every channel and upserts them as pending.
-func (s *Syncer) scan(ctx context.Context, client *nvr.Client, settings store.Settings, req SyncRequest, p *progress) {
-	now := time.Now().Unix()
-	to := req.To
-	if to <= 0 {
-		to = syncCutoff(settings, now)
-	}
-	backfillH := settings.BackfillH
-	if backfillH <= 0 {
-		backfillH = defaultBackfillH
-	}
-	backfill := int64(backfillH) * 3600
-
-	for _, ch := range req.Channels {
-		from := req.From
-		if from <= 0 {
-			if req.Force {
-				from = to - backfill
-			} else {
-				from = s.st.MaxSyncedEnd(ch)
-				if from <= 0 {
-					from = to - backfill
-				}
-			}
-		}
-		if from < 0 {
-			from = 0
-		}
-		if from >= to {
-			s.st.Log("info", "scan", fmt.Sprintf("cam%d 已是最新（水位 %s）", ch, fmtTS(from)))
-			continue
-		}
-		s.st.Log("info", "scan", fmt.Sprintf("扫描 cam%d：%s ~ %s", ch, fmtTS(from), fmtTS(to)))
-
-		segs, err := mediaListRange(ctx, client, ch, from, to)
-		if err != nil {
-			p.setError(err)
-			s.st.Log("error", "scan", fmt.Sprintf("cam%d 列出录像失败: %v", ch, err))
-			continue
-		}
-		if len(segs) == 0 {
-			s.st.Log("info", "scan", fmt.Sprintf("cam%d 该时段无录像", ch))
-			continue
-		}
-		segs = dropCoveredClips(segs)
-
-		doneKeys := map[segKey]bool{}
-		if !req.Force {
-			for _, old := range s.listChannel(ch, "done") {
-				doneKeys[segKey{old.Ch, old.Start, old.End}] = true
-			}
-		}
-
-		added := 0
-		for _, ms := range segs {
-			seg := store.Segment{
-				Ch:        ch,
-				Start:     ms.Start,
-				End:       ms.End,
-				Size:      ms.Size,
-				EventType: ms.EventType,
-				Status:    "pending",
-			}
-			if seg.End <= seg.Start {
-				seg.Status = "skipped"
-				seg.Err = "empty time range"
-				_ = s.st.UpsertSegment(seg)
-				continue
-			}
-			if !req.Force && doneKeys[segKey{seg.Ch, seg.Start, seg.End}] {
-				continue
-			}
-			if err := s.st.UpsertSegment(seg); err != nil {
-				s.st.Log("warn", "scan", fmt.Sprintf("cam%d 记录段 %s 失败: %v", ch, fmtTS(seg.Start), err))
-				continue
-			}
-			added++
-		}
-		s.st.Log("info", "scan", fmt.Sprintf("cam%d 扫描完成：%d 段，新增/重置 %d 段", ch, len(segs), added))
-	}
-}
-
+// segKey identifies a segment row in the index.
 type segKey struct {
-	ch    int
-	start int64
-	end   int64
+	Ch         int
+	Start, End int64
 }
 
-// collectQueue returns every pending/failed segment for the selected
-// channels, sorted by start time. Stale "syncing" entries (left behind by a
-// crash) are reset to pending and included.
 func (s *Syncer) collectQueue(channels []int, from, to int64) []store.Segment {
 	seen := map[segKey]bool{}
 	var queue []store.Segment

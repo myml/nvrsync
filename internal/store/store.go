@@ -69,7 +69,6 @@ type Settings struct {
 	StorageDir  string `json:"storage_dir"`
 	Channels    []int  `json:"channels"`
 	AutoMinutes int    `json:"auto_minutes"`
-	BackfillH   int    `json:"backfill_hours"`
 	RetentionD  int    `json:"retention_days"`
 	Transcode   bool   `json:"transcode"`
 	FFmpeg      string `json:"ffmpeg"`
@@ -359,25 +358,6 @@ func (s *Store) DeleteSegment(ch int, start, end int64) error {
 		return fmt.Errorf("store: delete segment: %w", err)
 	}
 	return nil
-}
-
-// MaxSyncedEnd returns the largest End among successfully synced segments for
-// ch. A non-positive ch considers all channels. It returns 0 when there is no
-// such segment.
-func (s *Store) MaxSyncedEnd(ch int) int64 {
-	// local_only segments are still on disk, so they must keep the watermark
-	// from moving backwards and re-downloading footage that is already there.
-	query := "SELECT COALESCE(MAX(end_ts), 0) FROM segments WHERE status IN ('done', 'local_only')"
-	args := []any{}
-	if ch > 0 {
-		query += " AND ch = ?"
-		args = append(args, ch)
-	}
-	var max int64
-	if err := s.db.QueryRow(query, args...).Scan(&max); err != nil {
-		return 0
-	}
-	return max
 }
 
 // Log appends a log entry, keeps at most maxLogs entries in the database and

@@ -44,7 +44,6 @@ type Settings struct {
     StorageDir  string `json:"storage_dir"`   // 录像落盘根目录
     Channels    []int  `json:"channels"`      // 要同步的通道
     AutoMinutes int    `json:"auto_minutes"`  // 自动同步间隔（分钟），0=关闭
-    BackfillH   int    `json:"backfill_hours"`// 首次回填时长
     RetentionD  int    `json:"retention_days"`// 0=不删
     Transcode   bool   `json:"transcode"`     // 是否用 ffmpeg 生成 H.264 代理
     FFmpeg      string `json:"ffmpeg"`        // ffmpeg 路径
@@ -145,4 +144,4 @@ $DATA/
   表格列：通道、时间段、大小、状态、同步时间、操作（立即同步）；底部「同步日志」时间线（level 着色、可折叠、自动刷新）。
 - **录像**：天卡片墙（日期、通道数、总时长、大小）→ 点开某天进入时间轴播放器；
   时间轴为一天 24h 的进度条，按段着色，点击跳转；播放器用 hls.js，加载 `/api/playlist`。
-- **设置**：分四张卡片——「NVR 连接」「同步与存储」（含同步通道、自动同步间隔、回填、保留、同步截止、转码）「索引（对账）」（对账回看天数、对账间隔、对账通道）「账户安全」（启用登录保护、用户名、设置/修改密码）；保存/测试连接按钮。
+- **设置**：分四张卡片——「NVR 连接」「同步与存储」（含同步通道、自动同步间隔、保留、同步截止、转码）「索引（对账）」（对账回看天数、对账间隔、对账通道）「账户安全」（启用登录保护、用户名、设置/修改密码）；保存/测试连接按钮。

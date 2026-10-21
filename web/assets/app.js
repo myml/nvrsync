@@ -588,7 +588,6 @@
       storage_dir: typeof raw.storage_dir === 'string' ? raw.storage_dir : '',
       channels: channels,
       auto_minutes: toInt(raw.auto_minutes, 0),
-      backfill_hours: toInt(raw.backfill_hours, 0),
       retention_days: toInt(raw.retention_days, 0),
       transcode: !!raw.transcode,
       ffmpeg: typeof raw.ffmpeg === 'string' ? raw.ffmpeg : '',
@@ -2170,11 +2169,6 @@
       min: '0', step: '1'
     });
 
-    var backfillInput = el('input', {
-      class: 'control', id: 'set-backfill', type: 'number', value: String(saved.backfill_hours),
-      min: '0', step: '1'
-    });
-
     var catalogInput = el('input', {
       class: 'control', id: 'set-catalog', type: 'number', value: String(saved.catalog_days),
       min: '0', step: '1'
@@ -2333,16 +2327,12 @@
     var policyCard = el('section', { class: 'card form-card' }, [
       el('div', { class: 'card-head' }, [
         el('h2', {}, ['同步与存储']),
-        el('span', { class: 'muted', text: '频率、回填与保留策略' })
+        el('span', { class: 'muted', text: '频率、保留与转码策略' })
       ]),
       el('div', { class: 'form-grid' }, [
         field('自动同步间隔（分钟）', autoInput, {
           id: 'set-auto',
           hint: '0 表示关闭自动同步。'
-        }),
-        field('首次回填（小时）', backfillInput, {
-          id: 'set-backfill',
-          hint: '首次同步时向前回溯的时长。'
         }),
         field('同步截止', cutoffSelect, {
           id: 'set-cutoff',
@@ -2630,7 +2620,6 @@
       storage_dir: String(value('set-storage')).trim(),
       channels: channels,
       auto_minutes: toInt(value('set-auto'), 0),
-      backfill_hours: toInt(value('set-backfill'), 0),
       retention_days: toInt(value('set-retention'), 0),
       transcode: !!(form.querySelector('#set-transcode') || {}).checked,
       ffmpeg: String(value('set-ffmpeg')).trim(),
@@ -2653,7 +2642,6 @@
       return '管理端口需在 0–65535 之间';
     }
     if (settings.auto_minutes < 0) return '自动同步间隔不能为负数';
-    if (settings.backfill_hours < 0) return '回填小时数不能为负数';
     if (settings.retention_days < 0) return '保留天数不能为负数';
     if (settings.cutoff === 'days' && settings.cutoff_days < 1) return '截止天数至少为 1';
     if (settings.catalog_days < 0) return '对账范围不能为负数';

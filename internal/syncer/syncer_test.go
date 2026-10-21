@@ -174,10 +174,16 @@ func TestSyncDownloadsSegments(t *testing.T) {
 	err = st.SaveSettings(store.Settings{
 		NVRHost: f.host(), NVRUser: "admin", NVRPass: "secret",
 		AdminPort: f.adminPort(), StorageDir: storage,
-		Channels: []int{1}, BackfillH: 1,
+		Channels: []int{1},
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	// Discovery is the catalogue loop's job; the test seeds the index directly.
+	for _, seg := range [][2]int64{{now - 900, now - 780}, {now - 780, now - 660}} {
+		if err := st.UpsertSegment(store.Segment{Ch: 1, Start: seg[0], End: seg[1], Status: "pending"}); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	s := New(st)
@@ -239,14 +245,12 @@ func TestSyncDownloadsSegments(t *testing.T) {
 	if logs := st.Logs(0, ""); len(logs) == 0 {
 		t.Error("expected sync logs")
 	}
+	// A sync drains the index only; it must not query the media list.
 	f.mu.Lock()
-	listings, channels := f.listings, append([]string(nil), f.channels...)
+	listings := f.listings
 	f.mu.Unlock()
-	if listings == 0 {
-		t.Error("media list was never called")
-	}
-	if len(channels) == 0 || channels[0] != "0" {
-		t.Errorf("channels sent = %v, want [0] (physical 1)", channels)
+	if listings != 0 {
+		t.Errorf("media list was called %d times during a sync, want 0", listings)
 	}
 }
 
@@ -356,8 +360,11 @@ func TestStopCancelsStalledDownload(t *testing.T) {
 	if err := st.SaveSettings(store.Settings{
 		NVRHost: f.host(), NVRUser: "admin", NVRPass: "secret",
 		AdminPort: f.adminPort(), StorageDir: filepath.Join(dataDir, "storage"),
-		Channels: []int{1}, BackfillH: 1,
+		Channels: []int{1},
 	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertSegment(store.Segment{Ch: 1, Start: now - 600, End: now - 300, Status: "pending"}); err != nil {
 		t.Fatal(err)
 	}
 	s := New(st)
