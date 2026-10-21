@@ -1,13 +1,16 @@
 # syntax=docker/dockerfile:1
 FROM golang:1.26-alpine AS build
 WORKDIR /src
+ARG VERSION=dev
 
 # Dependencies first so source edits do not invalidate the module cache.
 COPY go.mod go.sum* ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/nvrsync ./cmd/nvrsync
+RUN CGO_ENABLED=0 go build -trimpath \
+    -ldflags "-s -w -X main.Version=${VERSION}" \
+    -o /out/nvrsync ./cmd/nvrsync
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata ffmpeg \
