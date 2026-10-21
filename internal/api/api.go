@@ -595,7 +595,14 @@ func (s *server) handleFallback(w http.ResponseWriter, r *http.Request) {
 func (s *server) assetHandler() http.Handler {
 	fileServer := http.FileServerFS(s.assets)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "public, max-age=3600")
+		// The application bundle changes with every release, so it must be
+		// revalidated; only the vendored player is large and stable enough to
+		// cache for a day.
+		if strings.HasSuffix(r.URL.Path, "/vendor/hls.min.js") {
+			w.Header().Set("Cache-Control", "public, max-age=86400")
+		} else {
+			w.Header().Set("Cache-Control", "no-cache")
+		}
 		fileServer.ServeHTTP(w, r)
 	})
 }
