@@ -360,7 +360,7 @@ func (s *Syncer) scan(ctx context.Context, client *nvr.Client, settings store.Se
 	now := time.Now().Unix()
 	to := req.To
 	if to <= 0 {
-		to = now
+		to = syncCutoff(settings, now)
 	}
 	backfillH := settings.BackfillH
 	if backfillH <= 0 {
@@ -448,6 +448,10 @@ type segKey struct {
 func (s *Syncer) collectQueue(channels []int) []store.Segment {
 	seen := map[segKey]bool{}
 	var queue []store.Segment
+	// Segments left pending from earlier runs must respect the cutoff too,
+	// otherwise a manual run could still pull a segment that Settings.Cutoff
+	// forbids (and that may still be growing).
+	cutoff := syncCutoff(s.st.Settings(), time.Now().Unix())
 	for _, ch := range channels {
 		for _, status := range []string{"pending", "failed", "syncing"} {
 			for _, seg := range s.listChannel(ch, status) {
@@ -464,6 +468,9 @@ func (s *Syncer) collectQueue(channels []int) []store.Segment {
 					seg.Status = "skipped"
 					seg.Err = "empty time range"
 					_ = s.st.UpsertSegment(seg)
+					continue
+				}
+				if seg.End > cutoff {
 					continue
 				}
 				if isLive(seg, time.Now().Unix()) {
@@ -854,6 +861,28 @@ func fmtTS(unix int64) string {
 func segTime(seg store.Segment) string {
 	return time.Unix(seg.Start, 0).In(time.Local).Format("01-02 15:04:05") + " - " +
 		time.Unix(seg.End, 0).In(time.Local).Format("15:04:05")
+}
+
+// syncCutoff returns the newest wall clock time that may be synced according
+// to Settings.Cutoff. "latest" keeps the small liveGuard safety window,
+// "yesterday" stops at 00:00 of today (so only closed days are fetched) and
+// "days" stops N days back at midnight.
+func syncCutoff(settings store.Settings, now int64) int64 {
+	latest := now - liveGuard
+	local := time.Unix(now, 0).In(time.Local)
+	midnight := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, time.Local).Unix()
+	switch strings.TrimSpace(settings.Cutoff) {
+	case "yesterday":
+		return midnight
+	case "days":
+		days := settings.CutoffDays
+		if days < 1 {
+			days = 1
+		}
+		return midnight - int64(days)*86400
+	default:
+		return latest
+	}
 }
 
 // isLive reports whether a segment may still be recording, i.e. its end is

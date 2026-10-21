@@ -448,3 +448,53 @@ func TestLiveSegmentsStayPending(t *testing.T) {
 		t.Errorf("isLive classified segments incorrectly")
 	}
 }
+
+func TestSyncCutoff(t *testing.T) {
+	now := time.Date(2026, 10, 21, 14, 30, 0, 0, time.Local).Unix()
+	midnight := time.Date(2026, 10, 21, 0, 0, 0, 0, time.Local).Unix()
+
+	cases := []struct {
+		name string
+		set  store.Settings
+		want int64
+	}{
+		{"latest", store.Settings{}, now - liveGuard},
+		{"yesterday", store.Settings{Cutoff: "yesterday"}, midnight},
+		{"two days", store.Settings{Cutoff: "days", CutoffDays: 2}, midnight - 2*86400},
+		{"days fallback", store.Settings{Cutoff: "days", CutoffDays: 0}, midnight - 86400},
+		{"unknown", store.Settings{Cutoff: "bogus"}, now - liveGuard},
+	}
+	for _, tc := range cases {
+		if got := syncCutoff(tc.set, now); got != tc.want {
+			t.Errorf("%s: syncCutoff = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestCutoffExcludesPendingSegments(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := st.SaveSettings(store.Settings{Cutoff: "yesterday"}); err != nil {
+		t.Fatalf("save settings: %v", err)
+	}
+	now := time.Now().In(time.Local)
+	midnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local).Unix()
+
+	today := store.Segment{Ch: 1, Start: midnight + 3600, End: midnight + 3660, Status: "pending"}
+	yesterday := store.Segment{Ch: 1, Start: midnight - 7200, End: midnight - 3600, Status: "pending"}
+	for _, seg := range []store.Segment{today, yesterday} {
+		if err := st.UpsertSegment(seg); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+	}
+
+	queue := New(st).collectQueue([]int{1})
+	if len(queue) != 1 {
+		t.Fatalf("queue = %d segments, want 1: %+v", len(queue), queue)
+	}
+	if queue[0].End != yesterday.End {
+		t.Errorf("queued %+v, want only yesterday's segment", queue[0])
+	}
+}

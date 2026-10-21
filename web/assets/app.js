@@ -571,7 +571,9 @@
       backfill_hours: toInt(raw.backfill_hours, 0),
       retention_days: toInt(raw.retention_days, 0),
       transcode: !!raw.transcode,
-      ffmpeg: typeof raw.ffmpeg === 'string' ? raw.ffmpeg : ''
+      ffmpeg: typeof raw.ffmpeg === 'string' ? raw.ffmpeg : '',
+      cutoff: raw.cutoff === 'yesterday' || raw.cutoff === 'days' ? raw.cutoff : 'latest',
+      cutoff_days: toInt(raw.cutoff_days, 0)
     };
   }
 
@@ -2128,6 +2130,28 @@
       min: '0', step: '1'
     });
 
+    var cutoffSelect = el('select', { class: 'control', id: 'set-cutoff' }, [
+      el('option', { value: 'latest' }, ['最新（约 2 分钟前）']),
+      el('option', { value: 'yesterday' }, ['昨天 23:59']),
+      el('option', { value: 'days' }, ['N 天前'])
+    ]);
+    cutoffSelect.value = saved.cutoff || 'latest';
+
+    var cutoffDaysInput = el('input', {
+      class: 'control', id: 'set-cutoff-days', type: 'number',
+      value: String(saved.cutoff_days > 0 ? saved.cutoff_days : 1), min: '1', step: '1'
+    });
+    var cutoffDaysField = field('截止天数', cutoffDaysInput, {
+      id: 'set-cutoff-days',
+      hint: '同步到 N 天前的 00:00，只处理已完整的录像。'
+    });
+
+    function syncCutoffFields() {
+      var byDays = cutoffSelect.value === 'days';
+      cutoffDaysInput.disabled = !byDays;
+      cutoffDaysField.classList.toggle('is-disabled', !byDays);
+    }
+
     var retentionInput = el('input', {
       class: 'control', id: 'set-retention', type: 'number', value: String(saved.retention_days),
       min: '0', step: '1'
@@ -2238,6 +2262,11 @@
           id: 'set-backfill',
           hint: '首次同步时向前回溯的时长。'
         }),
+        field('同步截止', cutoffSelect, {
+          id: 'set-cutoff',
+          hint: '只同步到此时间之前。「昨天」表示今天的录像等明天再同步，永远不会碰到正在写入的段。'
+        }),
+        cutoffDaysField,
         field('保留天数', retentionInput, {
           id: 'set-retention',
           hint: '0 表示不自动删除旧录像。'
@@ -2312,10 +2341,12 @@
     form.addEventListener('input', refreshDirty);
     form.addEventListener('change', function (event) {
       if (event.target === switchInput) syncSwitch();
+      if (event.target === cutoffSelect) syncCutoffFields();
       refreshDirty();
     });
 
     switchInput.addEventListener('change', syncSwitch);
+    syncCutoffFields();
 
     saveBtn.addEventListener('click', function () {
       withBusy(saveBtn, async function () {
@@ -2377,7 +2408,9 @@
       backfill_hours: toInt(value('set-backfill'), 0),
       retention_days: toInt(value('set-retention'), 0),
       transcode: !!(form.querySelector('#set-transcode') || {}).checked,
-      ffmpeg: String(value('set-ffmpeg')).trim()
+      ffmpeg: String(value('set-ffmpeg')).trim(),
+      cutoff: String(value('set-cutoff')).trim() || 'latest',
+      cutoff_days: toInt(value('set-cutoff-days'), 1)
     };
   }
 
@@ -2388,6 +2421,7 @@
     if (settings.auto_minutes < 0) return '自动同步间隔不能为负数';
     if (settings.backfill_hours < 0) return '回填小时数不能为负数';
     if (settings.retention_days < 0) return '保留天数不能为负数';
+    if (settings.cutoff === 'days' && settings.cutoff_days < 1) return '截止天数至少为 1';
     return '';
   }
 

@@ -72,6 +72,12 @@ type Settings struct {
 	RetentionD  int    `json:"retention_days"`
 	Transcode   bool   `json:"transcode"`
 	FFmpeg      string `json:"ffmpeg"`
+	// Cutoff limits how recent a recording may be to be synced:
+	// "latest" (now), "yesterday" (end of yesterday) or "days" (N days ago,
+	// CutoffDays). Synchronising only closed days never touches a segment
+	// that is still being written.
+	Cutoff     string `json:"cutoff"`
+	CutoffDays int    `json:"cutoff_days"`
 }
 
 // SyncState describes the progress of the currently running (or last) sync.

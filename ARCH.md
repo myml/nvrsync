@@ -48,6 +48,9 @@ type Settings struct {
     RetentionD  int    `json:"retention_days"`// 0=不删
     Transcode   bool   `json:"transcode"`     // 是否用 ffmpeg 生成 H.264 代理
     FFmpeg      string `json:"ffmpeg"`        // ffmpeg 路径
+    // 同步截止：latest=最新（now-2min）/ yesterday=昨天 23:59 / days=N 天前 00:00
+    Cutoff     string `json:"cutoff"`
+    CutoffDays int    `json:"cutoff_days"`
 }
 ```
 
