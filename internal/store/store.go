@@ -293,7 +293,9 @@ func (s *Store) DeleteSegment(ch int, start, end int64) error {
 // ch. A non-positive ch considers all channels. It returns 0 when there is no
 // such segment.
 func (s *Store) MaxSyncedEnd(ch int) int64 {
-	query := "SELECT COALESCE(MAX(end_ts), 0) FROM segments WHERE status = 'done'"
+	// local_only segments are still on disk, so they must keep the watermark
+	// from moving backwards and re-downloading footage that is already there.
+	query := "SELECT COALESCE(MAX(end_ts), 0) FROM segments WHERE status IN ('done', 'local_only')"
 	args := []any{}
 	if ch > 0 {
 		query += " AND ch = ?"

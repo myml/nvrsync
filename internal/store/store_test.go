@@ -526,14 +526,15 @@ func TestDeleteAndMaxSyncedEnd(t *testing.T) {
 		mustUpsert(t, s, seg)
 	}
 
-	if got := s.MaxSyncedEnd(1); got != 400 {
-		t.Errorf("MaxSyncedEnd(1) = %d, want 400", got)
+	// local_only footage still exists on disk and must hold the watermark.
+	if got := s.MaxSyncedEnd(1); got != 1000 {
+		t.Errorf("MaxSyncedEnd(1) = %d, want 1000", got)
 	}
 	if got := s.MaxSyncedEnd(2); got != 800 {
 		t.Errorf("MaxSyncedEnd(2) = %d, want 800", got)
 	}
-	if got := s.MaxSyncedEnd(0); got != 800 {
-		t.Errorf("MaxSyncedEnd(0) = %d, want 800", got)
+	if got := s.MaxSyncedEnd(0); got != 1000 {
+		t.Errorf("MaxSyncedEnd(0) = %d, want 1000", got)
 	}
 	if got := s.MaxSyncedEnd(9); got != 0 {
 		t.Errorf("MaxSyncedEnd(9) = %d, want 0", got)
@@ -545,8 +546,8 @@ func TestDeleteAndMaxSyncedEnd(t *testing.T) {
 	if err := s.DeleteSegment(1, 100, 200); err != nil {
 		t.Fatalf("DeleteSegment: %v", err)
 	}
-	if got := s.MaxSyncedEnd(1); got != 400 {
-		t.Errorf("MaxSyncedEnd(1) after delete = %d, want 400", got)
+	if got := s.MaxSyncedEnd(1); got != 1000 {
+		t.Errorf("MaxSyncedEnd(1) after delete = %d, want 1000", got)
 	}
 	if _, total := s.Segments(SegFilter{}); total != 4 {
 		t.Errorf("total after delete = %d, want 4", total)
@@ -556,8 +557,8 @@ func TestDeleteAndMaxSyncedEnd(t *testing.T) {
 	if _, total := reopened.Segments(SegFilter{}); total != 4 {
 		t.Errorf("reopened total after delete = %d, want 4", total)
 	}
-	if got := reopened.MaxSyncedEnd(1); got != 400 {
-		t.Errorf("reopened MaxSyncedEnd(1) = %d, want 400", got)
+	if got := reopened.MaxSyncedEnd(1); got != 1000 {
+		t.Errorf("reopened MaxSyncedEnd(1) = %d, want 1000", got)
 	}
 }
 
