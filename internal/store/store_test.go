@@ -156,7 +156,7 @@ func TestOpenInitializes(t *testing.T) {
 	if segs, total := s.Segments(SegFilter{}); total != 0 || len(segs) != 0 || segs == nil {
 		t.Errorf("Segments() = %v, %d; want empty, 0", segs, total)
 	}
-	if logs := s.Logs(0, ""); len(logs) != 0 || logs == nil {
+	if logs := s.Logs(0, "", 0); len(logs) != 0 || logs == nil {
 		t.Errorf("Logs() = %v, want empty non-nil", logs)
 	}
 	if days := s.Days(0); len(days) != 0 || days == nil {
@@ -263,7 +263,7 @@ func TestLegacyStoreJSONIgnored(t *testing.T) {
 	if _, total := s.Segments(SegFilter{}); total != 0 {
 		t.Errorf("legacy segments imported: total = %d", total)
 	}
-	if logs := s.Logs(0, ""); len(logs) != 0 {
+	if logs := s.Logs(0, "", 0); len(logs) != 0 {
 		t.Errorf("legacy logs imported: %+v", logs)
 	}
 	if got := s.SyncState(); got != (SyncState{}) {
@@ -550,7 +550,7 @@ func TestLogLimitAndOrder(t *testing.T) {
 	}
 
 	// A non-positive limit means the newest 1000 entries.
-	recent := s.Logs(0, "")
+	recent := s.Logs(0, "", 0)
 	if len(recent) != defaultLogLimit {
 		t.Fatalf("len(Logs(0)) = %d, want %d", len(recent), defaultLogLimit)
 	}
@@ -559,7 +559,7 @@ func TestLogLimitAndOrder(t *testing.T) {
 	}
 
 	// At most maxLogs entries are kept.
-	logs := s.Logs(maxLogs, "")
+	logs := s.Logs(maxLogs, "", 0)
 	if len(logs) != maxLogs {
 		t.Fatalf("len(Logs) = %d, want %d", len(logs), maxLogs)
 	}
@@ -575,7 +575,7 @@ func TestLogLimitAndOrder(t *testing.T) {
 		}
 	}
 
-	errorsOnly := s.Logs(5, "error")
+	errorsOnly := s.Logs(5, "error", 0)
 	if len(errorsOnly) != 5 {
 		t.Fatalf("len(error logs) = %d, want 5", len(errorsOnly))
 	}
@@ -584,15 +584,15 @@ func TestLogLimitAndOrder(t *testing.T) {
 			t.Errorf("level filter leaked %q", e.Level)
 		}
 	}
-	if got := s.Logs(0, "warn"); len(got) != 0 || got == nil {
+	if got := s.Logs(0, "warn", 0); len(got) != 0 || got == nil {
 		t.Errorf("warn logs = %v, want empty non-nil", got)
 	}
 
 	reopened := openStoreAt(t, dir)
-	if got := reopened.Logs(maxLogs, ""); len(got) != maxLogs {
+	if got := reopened.Logs(maxLogs, "", 0); len(got) != maxLogs {
 		t.Errorf("reopened logs = %d, want %d", len(got), maxLogs)
 	}
-	if got := reopened.Logs(1, ""); len(got) != 1 || got[0].Msg != fmt.Sprintf("msg %d", total-1) {
+	if got := reopened.Logs(1, "", 0); len(got) != 1 || got[0].Msg != fmt.Sprintf("msg %d", total-1) {
 		t.Errorf("reopened newest log = %+v", got)
 	}
 }
@@ -757,7 +757,7 @@ func TestConcurrentAccess(t *testing.T) {
 					got.Channels[0] = 99 // must not race with the store
 				}
 				s.Segments(SegFilter{Ch: 1})
-				s.Logs(10, "info")
+				s.Logs(10, "info", 0)
 				s.Days(1)
 				_ = s.SyncState()
 			}
@@ -776,7 +776,7 @@ func TestConcurrentAccess(t *testing.T) {
 	if len(settings.Channels) != 2 || settings.Channels[0] != 1 {
 		t.Errorf("final settings = %+v", settings)
 	}
-	if logs := s.Logs(defaultLogLimit, ""); len(logs) != 80 {
+	if logs := s.Logs(defaultLogLimit, "", 0); len(logs) != 80 {
 		t.Errorf("final logs = %d, want 80", len(logs))
 	}
 }

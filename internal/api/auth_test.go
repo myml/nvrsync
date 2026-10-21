@@ -239,7 +239,7 @@ func TestAuthLogsNeverContainPasswords(t *testing.T) {
 	a.login("admin", "super-secret-pw")
 
 	sawFailure, sawSuccess := false, false
-	for _, entry := range a.st.Logs(0, "") {
+	for _, entry := range a.st.Logs(0, "", 0) {
 		if entry.Kind != "auth" {
 			continue
 		}

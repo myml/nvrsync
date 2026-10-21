@@ -242,7 +242,7 @@ func TestSyncDownloadsSegments(t *testing.T) {
 	if state.Running || state.Done != 2 || state.Total != 2 || state.Bytes != 752 || state.Speed <= 0 {
 		t.Errorf("sync state = %+v, want finished 2/2 752 bytes", state)
 	}
-	if logs := st.Logs(0, ""); len(logs) == 0 {
+	if logs := st.Logs(0, "", 0); len(logs) == 0 {
 		t.Error("expected sync logs")
 	}
 	// A sync drains the index only; it must not query the media list.

@@ -417,9 +417,15 @@ func (s *server) handleLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The store filters by level and returns newest first, so a request for
-	// the newest N errors does not get diluted by unrelated log levels.
-	logs := s.st.Logs(limit, level)
+	ch, err := parseIntParam(r.URL.Query().Get("ch"), 0)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid ch: "+err.Error())
+		return
+	}
+
+	// The store filters by level/channel and returns newest first, so a request
+	// for the newest N errors does not get diluted by unrelated log levels.
+	logs := s.st.Logs(limit, level, ch)
 	if logs == nil {
 		logs = []store.LogEntry{}
 	}

@@ -2255,3 +2255,21 @@ input[type="date"]::-webkit-calendar-picker-indicator {
 .stat-card.is-warn .stat-value {
   color: #ffa2aa;
 }
+
+.logs-filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px 0;
+}
+
+.logs-filter .control {
+  width: auto;
+  min-width: 120px;
+}
+
+.log-cam {
+  color: #8bb9ff;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
+}

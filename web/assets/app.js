@@ -538,7 +538,7 @@
     statusError: '',
     statusHooks: {},
     recordings: { ch: null },
-    logs: { open: true }
+    logs: { open: true, ch: 0 }
   };
 
   /** 设置里的 channels → 去重、排序后的正整数数组；为空时回退 1..8。 */
@@ -830,8 +830,20 @@
         el('h2', {}, ['同步日志', logCount]),
         el('span', { class: 'chevron' }, [icon('chevron')])
       ]);
+      var logChSelect = el('select', { class: 'control log-ch', id: 'log-ch' },
+        [el('option', { value: '0', text: '全部通道' })].concat(
+          availableChannels().map(function (ch) {
+            return el('option', { value: String(ch), text: 'CAM ' + ch });
+          })
+        )
+      );
+      logChSelect.value = String(state.logs.ch || 0);
       var logsCard = el('section', { class: 'card logs-card' }, [
         logsToggle,
+        el('div', { class: 'logs-filter' }, [
+          el('span', { class: 'muted', text: '按通道：' }),
+          logChSelect
+        ]),
         el('div', { class: 'logs-body' }, [logScroll])
       ]);
 
@@ -896,6 +908,11 @@
 
       startBtn.addEventListener('click', function () { startSync(view); });
       stopBtn.addEventListener('click', function () { stopSync(view); });
+
+      logChSelect.addEventListener('change', function () {
+        state.logs.ch = toInt(logChSelect.value, 0);
+        loadLogs(view);
+      });
 
       logsToggle.addEventListener('click', function () {
         state.logs.open = !state.logs.open;
@@ -1330,7 +1347,8 @@
   async function loadLogs(view, opts) {
     opts = opts || {};
     var seq = ++view.logsSeq;
-    var res = await api('/api/logs?limit=' + LOG_LIMIT, { quiet: !!opts.quiet });
+    var ch = state.logs.ch > 0 ? '&ch=' + state.logs.ch : '';
+    var res = await api('/api/logs?limit=' + LOG_LIMIT + ch, { quiet: !!opts.quiet });
     if (view.destroyed || seq !== view.logsSeq) return;
 
     if (!res.ok) {
@@ -1363,6 +1381,7 @@
         el('span', { class: 'log-ts', text: formatDateTime(log.ts) }),
         el('span', { class: 'log-level', text: String(log.level || 'info') }),
         el('span', { class: 'log-kind', text: String(log.kind || '') }),
+        log.ch > 0 ? el('span', { class: 'log-cam', text: 'CAM ' + log.ch }) : null,
         el('span', { class: 'log-msg', text: String(log.msg || '') })
       ]));
     });

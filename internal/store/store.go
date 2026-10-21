@@ -55,6 +55,7 @@ type Segment struct {
 // LogEntry is one line of sync history.
 type LogEntry struct {
 	TS    int64  `json:"ts"`
+	Ch    int    `json:"ch"`
 	Level string `json:"level"`
 	Kind  string `json:"kind"`
 	Msg   string `json:"msg"`
@@ -152,6 +153,35 @@ type Store struct {
 	// on disk yet.
 	settingsMu sync.RWMutex
 	settings   Settings
+}
+
+// ensureLogChannel adds the ch column to log tables created by older builds.
+func ensureLogChannel(db *sql.DB) error {
+	rows, err := db.Query("PRAGMA table_info(logs)")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	has := false
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var dflt any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == "ch" {
+			has = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	_, err = db.Exec("ALTER TABLE logs ADD COLUMN ch INTEGER NOT NULL DEFAULT 0")
+	return err
 }
 
 // Open opens (or creates) the store rooted at dir. It creates nvrsync.db and
@@ -365,8 +395,14 @@ func (s *Store) DeleteSegment(ch int, start, end int64) error {
 // reported to standard error but never returned, because logging must not
 // break a sync.
 func (s *Store) Log(level, kind, msg string) {
+	s.LogCh(0, level, kind, msg)
+}
+
+// LogCh appends a log entry tagged with the channel it belongs to (0 = the
+// process as a whole).
+func (s *Store) LogCh(ch int, level, kind, msg string) {
 	now := time.Now()
-	entry := LogEntry{TS: now.Unix(), Level: level, Kind: kind, Msg: msg}
+	entry := LogEntry{TS: now.Unix(), Ch: ch, Level: level, Kind: kind, Msg: msg}
 	if err := s.appendLog(entry); err != nil {
 		fmt.Fprintf(os.Stderr, "store: append log: %v\n", err)
 	}
@@ -376,16 +412,24 @@ func (s *Store) Log(level, kind, msg string) {
 
 // Logs returns up to limit log entries, newest first. A non-positive limit
 // means 1000 entries and an empty level means all levels.
-func (s *Store) Logs(limit int, level string) []LogEntry {
+func (s *Store) Logs(limit int, level string, ch int) []LogEntry {
 	if limit <= 0 {
 		limit = defaultLogLimit
 	}
 
-	query := "SELECT ts, level, kind, msg FROM logs"
+	query := "SELECT ts, ch, level, kind, msg FROM logs"
 	args := []any{}
+	var wheres []string
 	if level != "" {
-		query += " WHERE level = ?"
+		wheres = append(wheres, "level = ?")
 		args = append(args, level)
+	}
+	if ch > 0 {
+		wheres = append(wheres, "ch = ?")
+		args = append(args, ch)
+	}
+	if len(wheres) > 0 {
+		query += " WHERE " + strings.Join(wheres, " AND ")
 	}
 	query += " ORDER BY id DESC LIMIT ?"
 	args = append(args, limit)
@@ -399,7 +443,7 @@ func (s *Store) Logs(limit int, level string) []LogEntry {
 
 	for rows.Next() {
 		var e LogEntry
-		if err := rows.Scan(&e.TS, &e.Level, &e.Kind, &e.Msg); err != nil {
+		if err := rows.Scan(&e.TS, &e.Ch, &e.Level, &e.Kind, &e.Msg); err != nil {
 			return out
 		}
 		out = append(out, e)

@@ -406,7 +406,7 @@ func (s *Syncer) collectQueue(channels []int, from, to int64) []store.Segment {
 				if isLive(seg, time.Now().Unix()) {
 					// Still recording: keep it pending and retry next round
 					// instead of persisting a truncated file.
-					s.st.Log("info", "download", fmt.Sprintf("cam%d %s 仍在写入，稍后再同步", seg.Ch, segTime(seg)))
+					s.st.LogCh(seg.Ch, "info", "download", fmt.Sprintf("%s 仍在写入，稍后再同步", segTime(seg)))
 					continue
 				}
 				queue = append(queue, seg)
@@ -486,13 +486,13 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 	if err != nil {
 		s.markFailed(seg, err)
 		p.setError(err)
-		s.st.Log("error", "download", fmt.Sprintf("cam%d %s: %v", seg.Ch, segTime(seg), err))
+		s.st.LogCh(seg.Ch, "error", "download", fmt.Sprintf("%s: %v", segTime(seg), err))
 		return
 	}
 	label := fmt.Sprintf("cam%d %s", seg.Ch, segTime(seg))
 	p.setCur(label)
 	s.publish(p, true)
-	s.st.Log("info", "download", fmt.Sprintf("%s 开始（NVR %s，本地 %s）", label, humanBytes(seg.Size), rel))
+	s.st.LogCh(seg.Ch, "info", "download", fmt.Sprintf("%s 开始（NVR %s，本地 %s）", label, humanBytes(seg.Size), rel))
 
 	// Mark syncing so the UI shows the current work item. A cancelled run
 	// resets it to pending below.
@@ -502,7 +502,7 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
 			delay := retryBase << (attempt - 1)
-			s.st.Log("warn", "download", fmt.Sprintf("%s 第 %d 次重试（等待 %s）", label, attempt, delay))
+			s.st.LogCh(seg.Ch, "warn", "download", fmt.Sprintf("%s 第 %d 次重试（等待 %s）", label, attempt, delay))
 			if !sleepCtx(ctx, delay) {
 				break
 			}
@@ -521,7 +521,7 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 			if secs := took.Seconds(); secs > 0 {
 				speed = float64(stats.Bytes) / secs / 1e6
 			}
-			s.st.Log("info", "download", fmt.Sprintf("%s 完成：%.1f MiB，%s，%.1f MB/s",
+			s.st.LogCh(seg.Ch, "info", "download", fmt.Sprintf("%s 完成：%.1f MiB，%s，%.1f MB/s",
 				label, float64(stats.Bytes)/(1<<20), took.Round(time.Millisecond), speed))
 			return
 		}
@@ -530,7 +530,7 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 		}
 		lastErr = err
 		p.setError(err)
-		s.st.Log("warn", "download", fmt.Sprintf("%s 下载失败: %v", label, err))
+		s.st.LogCh(seg.Ch, "warn", "download", fmt.Sprintf("%s 下载失败: %v", label, err))
 	}
 
 	if ctx.Err() != nil {
@@ -538,7 +538,7 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 		_ = s.st.UpsertSegment(store.Segment{Ch: seg.Ch, Start: seg.Start, End: seg.End, Status: "pending"})
 		p.setCur("")
 		s.publish(p, true)
-		s.st.Log("warn", "download", label+" 已取消，保留为 pending")
+		s.st.LogCh(seg.Ch, "warn", "download", label+" 已取消，保留为 pending")
 		return
 	}
 
@@ -1098,10 +1098,10 @@ func (s *Syncer) refreshCatalogDays(ctx context.Context, force, allowRunning boo
 		segs, err := mediaListRange(ctx, client, ch, from, to)
 		if err != nil {
 			if nvr.IsBusy(err) {
-				s.st.Log("warn", "catalog", fmt.Sprintf("cam%d NVR 繁忙（-40401），本轮跳过", ch))
+				s.st.LogCh(ch, "warn", "catalog", "NVR 繁忙（-40401），本轮跳过")
 				continue
 			}
-			s.st.Log("error", "catalog", fmt.Sprintf("cam%d 列出录像失败: %v", ch, err))
+			s.st.LogCh(ch, "error", "catalog", fmt.Sprintf("列出录像失败: %v", err))
 			continue
 		}
 		segs = dropCoveredClips(segs)

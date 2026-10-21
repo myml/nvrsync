@@ -55,9 +55,11 @@ var schemaStatements = []string{
 		ts    INTEGER NOT NULL,
 		level TEXT    NOT NULL,
 		kind  TEXT    NOT NULL,
+		ch    INTEGER NOT NULL DEFAULT 0,
 		msg   TEXT    NOT NULL
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level, id DESC)`,
+	`CREATE INDEX IF NOT EXISTS idx_logs_ch ON logs(ch, id DESC)`,
 	`CREATE TABLE IF NOT EXISTS sync_state (
 		id   INTEGER PRIMARY KEY CHECK (id = 1),
 		data TEXT    NOT NULL
@@ -108,6 +110,11 @@ func initSchema(db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+// migrate applies additive changes needed by databases created by older builds.
+func migrate(db *sql.DB) error {
+	return ensureLogChannel(db)
 }
 
 func scanSegment(rows *sql.Rows) (Segment, error) {
