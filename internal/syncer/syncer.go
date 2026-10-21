@@ -474,9 +474,11 @@ func (s *Syncer) collectQueue(channels []int, from, to int64) []store.Segment {
 				if seg.End > cutoff {
 					continue
 				}
-				// A run started with an explicit range only touches that range;
-				// otherwise it would silently pull every pending segment.
-				if from > 0 && seg.End <= from {
+				// A run started with an explicit range only touches segments
+				// that *start* inside it. Overlap matching would make a retry
+				// of a 10s event clip drag in the whole hour-long continuous
+				// recording that contains it.
+				if from > 0 && seg.Start < from {
 					continue
 				}
 				if to > 0 && seg.Start >= to {

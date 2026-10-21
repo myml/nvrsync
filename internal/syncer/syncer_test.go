@@ -566,6 +566,12 @@ func TestCollectQueueHonoursRange(t *testing.T) {
 			t.Fatalf("upsert: %v", err)
 		}
 	}
+	// A long segment that merely overlaps the range must not be queued: that
+	// is what made a single-clip retry pull an hour of footage.
+	overlapping := store.Segment{Ch: 1, Start: now - 8000, End: now - 3000, Status: "pending"}
+	if err := st.UpsertSegment(overlapping); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
 	queue := New(st).collectQueue([]int{1}, now-4000, now-3000)
 	if len(queue) != 1 || queue[0].Start != inRange.Start {
 		t.Fatalf("queue = %+v, want only the in-range segment", queue)

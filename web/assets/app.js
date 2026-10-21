@@ -1210,7 +1210,7 @@
         body: { channels: [seg.ch], from: seg.start, to: seg.end }
       });
       if (res.ok) {
-        toast('已提交同步：CAM ' + seg.ch + ' ' + formatDateTime(seg.start), 'success');
+        toast('已提交：CAM ' + seg.ch + ' ' + formatDateTime(seg.start) + '（仅该段）', 'success');
         state.sync.running = true;
         updateIndicator();
         updateRunButtons(view, state.sync);
