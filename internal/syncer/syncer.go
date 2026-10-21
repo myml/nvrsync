@@ -317,7 +317,19 @@ func (s *Syncer) run(ctx context.Context, req SyncRequest, done chan struct{}) {
 	}
 	s.st.Log("info", "scan", "NVR 登录成功")
 
-	s.scan(ctx, client, settings, req, p)
+	if req.From == 0 && req.To == 0 && settings.CatalogDays > 0 {
+		// The catalogue loop keeps the index fresh, so a plain "sync now" only
+		// has to drain pending segments instead of scanning the NVR again.
+		if _, err := s.refreshCatalog(ctx, false, true); err != nil {
+			if !errors.Is(err, ErrCatalogBusy) {
+				s.st.Log("warn", "scan", "同步前对账失败: "+err.Error())
+			}
+		} else {
+			s.st.Log("info", "scan", "使用本地索引（后台对账负责发现新录像）")
+		}
+	} else {
+		s.scan(ctx, client, settings, req, p)
+	}
 	if ctx.Err() != nil {
 		s.st.Log("warn", "scan", "同步已取消")
 		return
@@ -1136,6 +1148,12 @@ func (s *Syncer) RefreshCatalog(ctx context.Context) (CatalogResult, error) {
 // RefreshCatalogForce is RefreshCatalog with an option to bypass the cooldown.
 // It is used by the UI refresh button, which must always hit the NVR.
 func (s *Syncer) RefreshCatalogForce(ctx context.Context, force bool) (CatalogResult, error) {
+	return s.refreshCatalog(ctx, force, false)
+}
+
+// refreshCatalog is the shared implementation. allowRunning lets a sync use it
+// while it is itself marked as running.
+func (s *Syncer) refreshCatalog(ctx context.Context, force, allowRunning bool) (CatalogResult, error) {
 	if !s.catalogMu.TryLock() {
 		return CatalogResult{}, ErrCatalogBusy
 	}
@@ -1151,7 +1169,7 @@ func (s *Syncer) RefreshCatalogForce(ctx context.Context, force bool) (CatalogRe
 	if strings.TrimSpace(settings.NVRHost) == "" {
 		return res, errors.New("nvr_host 未配置")
 	}
-	if s.Running() {
+	if !allowRunning && s.Running() {
 		return res, ErrAlreadyRunning
 	}
 	channels := settings.CatalogChannels

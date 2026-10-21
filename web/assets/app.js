@@ -1309,7 +1309,7 @@
     view.progressFill.style.width = pct + '%';
     view.progressLabel.textContent = total > 0
       ? '同步中 ' + num(done) + '/' + num(total)
-      : '同步中（正在扫描 NVR）';
+      : '同步中（准备队列…）';
 
     var parts = [];
     if (total > 0) parts.push(done + '/' + total + ' 段');
