@@ -1565,7 +1565,7 @@
         el('div', { class: 'player-help' }, [
           icon('alert'),
           el('span', {
-            text: '浏览器可能不支持 HEVC/H.265 录像的解码。若画面黑屏或一直转圈，请改用 VLC 等播放器打开播放列表地址。'
+            text: '浏览器可能不支持 HEVC/H.265 录像的解码。若画面黑屏或一直转圈，请改用 VLC 等播放器打开播放列表地址，或在设置页开启转码（需 ffmpeg）。'
           })
         ])
       ]);
@@ -1624,6 +1624,11 @@
         return '/api/playlist?ch=' + encodeURIComponent(String(ch)) + '&date=' + encodeURIComponent(date);
       }
 
+      // 展示给 VLC 的绝对地址（hls.js 内部仍用相对路径）。
+      function absolutePlaylistURL() {
+        return location.origin + playlistURL();
+      }
+
       function showPlaybackError(title, hint, detail) {
         var actions = [
           button('重新加载', { icon: 'refresh', onClick: function () { load(); } }),
@@ -1636,7 +1641,7 @@
           el('div', { class: 've-icon' }, [icon('alert')]),
           el('h3', { text: title }),
           el('p', { text: hint }),
-          el('p', {}, [el('code', { text: playlistURL() })]),
+          el('p', {}, [el('code', { text: absolutePlaylistURL() })]),
           detail ? el('p', { class: 'small', text: '详细信息：' + detail }) : null,
           el('div', { class: 've-actions' }, actions)
         ]));
@@ -1704,7 +1709,7 @@
               showPlaybackError(
                 '无法播放这段录像',
                 '浏览器可能不支持 HEVC/H.265 编码，或者该段录像文件不完整。' +
-                '建议用 VLC 等支持 HEVC 的播放器打开下方播放列表地址。',
+                '建议用 VLC 等支持 HEVC 的播放器打开下方播放列表地址，或在设置页开启转码（需 ffmpeg）。',
                 String(detail)
               );
               destroyHls();
@@ -2061,7 +2066,7 @@
           state.settings = settings;
           state.channels = channelsFromSettings(settings);
           clear(host);
-          host.appendChild(buildSettingsForm(settings, view));
+          host.appendChild(buildSettingsForm(settings));
         });
       }
 
@@ -2072,7 +2077,7 @@
   };
 
   /** 生成设置表单并绑定保存 / 测试连接 / 密码可见性。 */
-  function buildSettingsForm(saved, view) {
+  function buildSettingsForm(saved) {
     var form = el('form', { class: 'settings-form', id: 'settings-form', novalidate: true });
 
     /* ---- 基础输入 ---- */
