@@ -320,10 +320,12 @@ func (s *Syncer) run(ctx context.Context, req SyncRequest, done chan struct{}) {
 	if req.From == 0 && req.To == 0 && settings.CatalogDays > 0 {
 		// The catalogue loop keeps the index fresh, so a plain "sync now" only
 		// has to drain pending segments instead of scanning the NVR again.
-		// Only refresh the newest days here: a full 30-day pass belongs to the
-		// background loop and would make "开始同步" sit in the queue-prep phase
-		// for a minute or more.
-		if _, err := s.refreshCatalogDays(ctx, true, true, recentSyncDays); err != nil {
+		// The background loop owns the index. If it ran recently there is
+		// nothing to do here; otherwise only the newest days are refreshed so
+		// "开始同步" does not wait for a full 30-day catalogue pass.
+		if s.catalogFresh() {
+			s.st.Log("info", "scan", "索引较新，直接下载待同步段")
+		} else if _, err := s.refreshCatalogDays(ctx, true, true, recentSyncDays); err != nil {
 			if !errors.Is(err, ErrCatalogBusy) && !errors.Is(err, ErrAlreadyRunning) {
 				s.st.Log("warn", "scan", "同步前更新索引失败: "+err.Error())
 			}
@@ -1106,6 +1108,10 @@ const mediaListPace = 150 * time.Millisecond
 // catalogPoll is the fallback reconcile interval when the setting is missing.
 const catalogPoll = 5 * time.Minute
 
+// catalogFreshFor is how long a catalogue result is considered recent enough
+// for a sync to skip its own refresh entirely.
+const catalogFreshFor = 10 * time.Minute
+
 // recentSyncDays is how many days a sync refreshes before draining the queue.
 const recentSyncDays = 2
 
@@ -1155,6 +1161,17 @@ func (s *Syncer) RefreshCatalog(ctx context.Context) (CatalogResult, error) {
 // It is used by the UI refresh button, which must always hit the NVR.
 func (s *Syncer) RefreshCatalogForce(ctx context.Context, force bool) (CatalogResult, error) {
 	return s.refreshCatalogDays(ctx, force, false, 0)
+}
+
+// catalogFresh reports whether a catalogue pass finished recently enough that
+// a sync can trust the index. A pass that is currently running also counts as
+// fresh, because the index is being updated right now.
+func (s *Syncer) catalogFresh() bool {
+	if !s.catalogMu.TryLock() {
+		return true
+	}
+	defer s.catalogMu.Unlock()
+	return !s.catalogAt.IsZero() && time.Since(s.catalogAt) < catalogFreshFor
 }
 
 // refreshCatalogDays is the shared implementation. allowRunning lets a sync use
