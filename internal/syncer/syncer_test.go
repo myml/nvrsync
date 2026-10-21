@@ -439,7 +439,7 @@ func TestLiveSegmentsStayPending(t *testing.T) {
 	}
 
 	s := New(st)
-	queue := s.collectQueue([]int{1})
+	queue := s.collectQueue([]int{1}, 0, 0)
 	if len(queue) != 1 {
 		t.Fatalf("expected only the closed segment in queue, got %d: %+v", len(queue), queue)
 	}
@@ -492,7 +492,7 @@ func TestCutoffExcludesPendingSegments(t *testing.T) {
 		}
 	}
 
-	queue := New(st).collectQueue([]int{1})
+	queue := New(st).collectQueue([]int{1}, 0, 0)
 	if len(queue) != 1 {
 		t.Fatalf("queue = %d segments, want 1: %+v", len(queue), queue)
 	}
@@ -550,5 +550,24 @@ func TestRefreshCatalogMarksLocalOnly(t *testing.T) {
 	}
 	if segs[0].Path != gone.Path {
 		t.Errorf("path = %q, want %q", segs[0].Path, gone.Path)
+	}
+}
+
+func TestCollectQueueHonoursRange(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	now := time.Now().Unix()
+	inRange := store.Segment{Ch: 1, Start: now - 3600, End: now - 3400, Status: "pending"}
+	outside := store.Segment{Ch: 1, Start: now - 7200, End: now - 7000, Status: "pending"}
+	for _, seg := range []store.Segment{inRange, outside} {
+		if err := st.UpsertSegment(seg); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+	}
+	queue := New(st).collectQueue([]int{1}, now-4000, now-3000)
+	if len(queue) != 1 || queue[0].Start != inRange.Start {
+		t.Fatalf("queue = %+v, want only the in-range segment", queue)
 	}
 }

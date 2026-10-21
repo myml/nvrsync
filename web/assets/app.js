@@ -2274,7 +2274,7 @@
     savedCatalogChannels.forEach(function (ch) {
       if (ch > catalogHighest) catalogHighest = ch;
     });
-    var catalogGrid = el('div', { class: 'ch-grid' });
+    var catalogGrid = el('div', { class: 'ch-grid', id: 'set-cat-grid' });
     for (var c = 1; c <= catalogHighest; c++) {
       var catalogBox = el('input', {
         type: 'checkbox',
@@ -2497,7 +2497,7 @@
       cutoff_days: toInt(value('set-cutoff-days'), 1),
       catalog_days: toInt(value('set-catalog'), 0),
       catalog_minutes: toInt(value('set-catalog-interval'), 0),
-      catalog_channels: $$('.ch-option input:checked', catalogGrid)
+      catalog_channels: $$('#set-cat-grid input:checked', form)
         .map(function (input) { return toInt(input.value, 0); })
         .filter(function (n) { return n > 0; })
         .sort(function (a, b) { return a - b; })

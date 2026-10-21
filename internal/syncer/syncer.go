@@ -309,7 +309,7 @@ func (s *Syncer) run(ctx context.Context, req SyncRequest, done chan struct{}) {
 		return
 	}
 
-	queue := s.collectQueue(req.Channels)
+	queue := s.collectQueue(req.Channels, req.From, req.To)
 	p.setTotal(len(queue))
 	s.publish(p, true)
 	if len(queue) == 0 {
@@ -446,7 +446,7 @@ type segKey struct {
 // collectQueue returns every pending/failed segment for the selected
 // channels, sorted by start time. Stale "syncing" entries (left behind by a
 // crash) are reset to pending and included.
-func (s *Syncer) collectQueue(channels []int) []store.Segment {
+func (s *Syncer) collectQueue(channels []int, from, to int64) []store.Segment {
 	seen := map[segKey]bool{}
 	var queue []store.Segment
 	// Segments left pending from earlier runs must respect the cutoff too,
@@ -472,6 +472,14 @@ func (s *Syncer) collectQueue(channels []int) []store.Segment {
 					continue
 				}
 				if seg.End > cutoff {
+					continue
+				}
+				// A run started with an explicit range only touches that range;
+				// otherwise it would silently pull every pending segment.
+				if from > 0 && seg.End <= from {
+					continue
+				}
+				if to > 0 && seg.Start >= to {
 					continue
 				}
 				if isLive(seg, time.Now().Unix()) {
