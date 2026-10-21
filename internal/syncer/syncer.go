@@ -320,12 +320,15 @@ func (s *Syncer) run(ctx context.Context, req SyncRequest, done chan struct{}) {
 	if req.From == 0 && req.To == 0 && settings.CatalogDays > 0 {
 		// The catalogue loop keeps the index fresh, so a plain "sync now" only
 		// has to drain pending segments instead of scanning the NVR again.
-		if _, err := s.refreshCatalog(ctx, false, true); err != nil {
-			if !errors.Is(err, ErrCatalogBusy) {
-				s.st.Log("warn", "scan", "同步前对账失败: "+err.Error())
+		// Only refresh the newest days here: a full 30-day pass belongs to the
+		// background loop and would make "开始同步" sit in the queue-prep phase
+		// for a minute or more.
+		if _, err := s.refreshCatalogDays(ctx, true, true, recentSyncDays); err != nil {
+			if !errors.Is(err, ErrCatalogBusy) && !errors.Is(err, ErrAlreadyRunning) {
+				s.st.Log("warn", "scan", "同步前更新索引失败: "+err.Error())
 			}
 		} else {
-			s.st.Log("info", "scan", "使用本地索引（后台对账负责发现新录像）")
+			s.st.Log("info", "scan", "已更新最近索引，开始下载")
 		}
 	} else {
 		s.scan(ctx, client, settings, req, p)
@@ -1103,6 +1106,9 @@ const mediaListPace = 150 * time.Millisecond
 // catalogPoll is the fallback reconcile interval when the setting is missing.
 const catalogPoll = 5 * time.Minute
 
+// recentSyncDays is how many days a sync refreshes before draining the queue.
+const recentSyncDays = 2
+
 // defaultCatalogDays is how far back the catalogue refresh looks when the
 // setting is not positive.
 const defaultCatalogDays = 7
@@ -1148,12 +1154,14 @@ func (s *Syncer) RefreshCatalog(ctx context.Context) (CatalogResult, error) {
 // RefreshCatalogForce is RefreshCatalog with an option to bypass the cooldown.
 // It is used by the UI refresh button, which must always hit the NVR.
 func (s *Syncer) RefreshCatalogForce(ctx context.Context, force bool) (CatalogResult, error) {
-	return s.refreshCatalog(ctx, force, false)
+	return s.refreshCatalogDays(ctx, force, false, 0)
 }
 
-// refreshCatalog is the shared implementation. allowRunning lets a sync use it
-// while it is itself marked as running.
-func (s *Syncer) refreshCatalog(ctx context.Context, force, allowRunning bool) (CatalogResult, error) {
+// refreshCatalogDays is the shared implementation. allowRunning lets a sync use
+// it while it is itself marked as running; daysOverride>0 limits the look-back
+// window (the sync only refreshes the most recent days instead of the full
+// catalogue window).
+func (s *Syncer) refreshCatalogDays(ctx context.Context, force, allowRunning bool, daysOverride int) (CatalogResult, error) {
 	if !s.catalogMu.TryLock() {
 		return CatalogResult{}, ErrCatalogBusy
 	}
@@ -1180,6 +1188,9 @@ func (s *Syncer) refreshCatalog(ctx context.Context, force, allowRunning bool) (
 		channels = []int{1}
 	}
 	days := settings.CatalogDays
+	if daysOverride > 0 {
+		days = daysOverride
+	}
 	if days <= 0 {
 		days = defaultCatalogDays
 	}
