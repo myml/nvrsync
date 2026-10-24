@@ -33,6 +33,10 @@ func TestAssetETagReturns304(t *testing.T) {
 
 func TestReadyEndpoint(t *testing.T) {
 	a := newTestAPI(t)
+	// HEAD must be treated like GET for readiness/liveness probes.
+	if rec := a.do("HEAD", "/api/ready", nil); rec.Code == http.StatusUnauthorized {
+		t.Fatalf("HEAD /api/ready was rejected as unauthorized")
+	}
 	rec := a.do("GET", "/api/ready", nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET /api/ready = %d; body=%s", rec.Code, rec.Body.String())
