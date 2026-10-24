@@ -255,6 +255,7 @@ func (s *Store) SaveSettings(settings Settings) error {
 	defer s.settingsMu.Unlock()
 
 	settings.AuthHash = s.settings.AuthHash
+	normalizeSettings(&settings)
 
 	if err := s.writeConfig(settings); err != nil {
 		return err
@@ -551,8 +552,8 @@ func (s *Store) appendLog(entry LogEntry) error {
 	defer tx.Rollback() //nolint:errcheck // rollback after commit is a no-op
 
 	if _, err := tx.Exec(
-		"INSERT INTO logs (ts, level, kind, msg) VALUES (?, ?, ?, ?)",
-		entry.TS, entry.Level, entry.Kind, entry.Msg,
+		"INSERT INTO logs (ts, ch, level, kind, msg) VALUES (?, ?, ?, ?, ?)",
+		entry.TS, entry.Ch, entry.Level, entry.Kind, entry.Msg,
 	); err != nil {
 		return err
 	}
@@ -676,10 +677,40 @@ func cloneSettings(in Settings) Settings {
 	return out
 }
 
-// normalizeSettings fills in a nil Channels slice so the JSON shape stays
-// stable across restarts.
+// normalizeSettings keeps the persisted JSON shape stable and removes
+// duplicated/negative channel numbers. Older builds allowed the settings API
+// to store duplicates (for example [1,1,2,2,...]), which made the UI and some
+// loops do the same work twice.
 func normalizeSettings(settings *Settings) {
 	if settings.Channels == nil {
 		settings.Channels = []int{}
 	}
+	settings.Channels = normalizeChannels(settings.Channels)
+	// CatalogChannels keeps its nil shape: nil means "follow Channels".
+	if settings.CatalogChannels != nil {
+		settings.CatalogChannels = normalizeChannels(settings.CatalogChannels)
+	}
+}
+
+// normalizeChannels returns a sorted, de-duplicated copy of in, dropping
+// non-positive values. A nil input stays nil so callers can distinguish "not
+// configured" from an explicitly empty list.
+func normalizeChannels(in []int) []int {
+	if in == nil {
+		return nil
+	}
+	seen := make(map[int]struct{}, len(in))
+	out := make([]int, 0, len(in))
+	for _, ch := range in {
+		if ch <= 0 {
+			continue
+		}
+		if _, ok := seen[ch]; ok {
+			continue
+		}
+		seen[ch] = struct{}{}
+		out = append(out, ch)
+	}
+	sort.Ints(out)
+	return out
 }

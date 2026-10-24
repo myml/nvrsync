@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -791,5 +792,63 @@ func TestCloseIsIdempotent(t *testing.T) {
 	}
 	if err := s.Close(); err != nil {
 		t.Errorf("second Close: %v", err)
+	}
+}
+
+// TestOpenMigratesLegacyLogChannel reproduces the schema shipped by the
+// previous release: logs has no ch column. Opening it must add the column
+// before creating idx_logs_ch, and LogCh must actually persist the channel.
+func TestOpenMigratesLegacyLogChannel(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, dbFileName)
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE logs (
+		id    INTEGER PRIMARY KEY AUTOINCREMENT,
+		ts    INTEGER NOT NULL,
+		level TEXT    NOT NULL,
+		kind  TEXT    NOT NULL,
+		msg   TEXT    NOT NULL
+	)`); err != nil {
+		t.Fatalf("create legacy logs: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO logs (ts, level, kind, msg) VALUES (1, 'info', 'scan', 'old')`); err != nil {
+		t.Fatalf("insert legacy log: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	silenceStdout(t)
+	s := openStoreAt(t, dir)
+	s.LogCh(3, "info", "download", "new")
+	logs := s.Logs(10, "", 3)
+	if len(logs) != 1 || logs[0].Ch != 3 || logs[0].Msg != "new" {
+		t.Fatalf("Logs(ch=3) = %+v, want the new entry with ch=3", logs)
+	}
+	all := s.Logs(10, "", 0)
+	if len(all) != 2 {
+		t.Fatalf("Logs(all) = %d entries, want 2", len(all))
+	}
+}
+
+func TestSaveSettingsNormalizesChannels(t *testing.T) {
+	s := openTestStore(t)
+	set := s.Settings()
+	set.Channels = []int{2, 1, 2, -1, 3, 3}
+	set.CatalogChannels = []int{4, 4, 2}
+	if err := s.SaveSettings(set); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+	got := s.Settings()
+	wantCh := []int{1, 2, 3}
+	if !reflect.DeepEqual(got.Channels, wantCh) {
+		t.Errorf("Channels = %v, want %v", got.Channels, wantCh)
+	}
+	wantCatalog := []int{2, 4}
+	if !reflect.DeepEqual(got.CatalogChannels, wantCatalog) {
+		t.Errorf("CatalogChannels = %v, want %v", got.CatalogChannels, wantCatalog)
 	}
 }

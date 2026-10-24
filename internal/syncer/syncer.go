@@ -44,6 +44,9 @@ const (
 	// maxAttempts includes the first try: two retries after a failure.
 	maxAttempts = 3
 	retryBase   = 2 * time.Second
+	// busyRetryBase is used for the NVR's -40401 ("no session budget") reply.
+	// It is transient; hammering the device with 2s retries makes it worse.
+	busyRetryBase = 10 * time.Second
 	// autoPoll is how often AutoLoop re-reads settings, so changing
 	// AutoMinutes takes effect without restarting the process.
 	autoPoll = 15 * time.Second
@@ -176,24 +179,42 @@ func (s *Syncer) Running() bool {
 // restart), and never starts a second run while one is in flight.
 func (s *Syncer) AutoLoop(ctx context.Context) {
 	var last time.Time
+	var retryAt time.Time
+	var failures int
 	for {
 		settings := s.st.Settings()
 		if settings.AutoMinutes <= 0 {
 			last = time.Time{}
+			retryAt = time.Time{}
+			failures = 0
 		} else {
 			interval := time.Duration(settings.AutoMinutes) * time.Minute
-			if last.IsZero() || time.Since(last) >= interval {
-				if !s.Running() {
-					err := s.Start(SyncRequest{})
-					switch {
-					case err == nil:
-						last = time.Now()
-						last = last.Truncate(time.Second)
-						s.st.Log("info", "scan", fmt.Sprintf("自动同步已启动（间隔 %d 分钟）", settings.AutoMinutes))
-					case errors.Is(err, ErrAlreadyRunning):
-						// another run is finishing; retry on the next poll
-					default:
-						s.st.Log("error", "scan", "自动同步启动失败: "+err.Error())
+			if (last.IsZero() || time.Since(last) >= interval) &&
+				!time.Now().Before(retryAt) && !s.Running() {
+				err := s.Start(SyncRequest{})
+				switch {
+				case err == nil:
+					failures = 0
+					retryAt = time.Time{}
+					last = time.Now().Truncate(time.Second)
+					s.st.Log("info", "scan", fmt.Sprintf("自动同步已启动（间隔 %d 分钟）", settings.AutoMinutes))
+				case errors.Is(err, ErrAlreadyRunning):
+					// another run is finishing; retry on the next poll
+				default:
+					// A misconfigured NVR must not produce a log line every
+					// 15 seconds forever. Back off up to 10 minutes.
+					failures++
+					backoff := 15 * time.Second
+					for i := 1; i < failures && i < 6; i++ {
+						backoff *= 2
+					}
+					if backoff > 10*time.Minute {
+						backoff = 10 * time.Minute
+					}
+					retryAt = time.Now().Add(backoff)
+					if failures == 1 || failures%10 == 0 {
+						s.st.Log("error", "scan", fmt.Sprintf("自动同步启动失败（第 %d 次，%s 后重试）: %v",
+							failures, backoff.Round(time.Second), err))
 					}
 				}
 			}
@@ -202,6 +223,15 @@ func (s *Syncer) AutoLoop(ctx context.Context) {
 		wait := autoPoll
 		if settings.AutoMinutes > 0 && !last.IsZero() {
 			remain := time.Duration(settings.AutoMinutes)*time.Minute - time.Since(last)
+			if remain < time.Second {
+				remain = time.Second
+			}
+			if remain < wait {
+				wait = remain
+			}
+		}
+		if !retryAt.IsZero() {
+			remain := time.Until(retryAt)
 			if remain < time.Second {
 				remain = time.Second
 			}
@@ -502,6 +532,9 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
 			delay := retryBase << (attempt - 1)
+			if nvr.IsBusy(lastErr) {
+				delay = busyRetryBase << (attempt - 1)
+			}
 			s.st.LogCh(seg.Ch, "warn", "download", fmt.Sprintf("%s 第 %d 次重试（等待 %s）", label, attempt, delay))
 			if !sleepCtx(ctx, delay) {
 				break
@@ -544,6 +577,29 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 
 	if lastErr == nil {
 		lastErr = errors.New("download failed")
+	}
+	if nvr.IsBusy(lastErr) {
+		// Leave the segment queued: marking thousands of segments failed just
+		// because the NVR ran out of sessions is what filled the index with
+		// 3,700 permanent-looking errors.
+		_ = s.st.UpsertSegment(store.Segment{
+			Ch: seg.Ch, Start: seg.Start, End: seg.End,
+			Status: "pending", Err: lastErr.Error(),
+		})
+		s.st.LogCh(seg.Ch, "warn", "download", label+" NVR 繁忙（-40401），保留为 pending")
+		p.setCur("")
+		s.publish(p, true)
+		return
+	}
+	if errors.Is(lastErr, nvr.ErrNoMedia) {
+		_ = s.st.UpsertSegment(store.Segment{
+			Ch: seg.Ch, Start: seg.Start, End: seg.End,
+			Status: "skipped", Err: "NVR 上已无此段",
+		})
+		s.st.LogCh(seg.Ch, "warn", "download", label+" NVR 上已无此段，标记 skipped")
+		p.setCur("")
+		s.publish(p, true)
+		return
 	}
 	s.markFailed(seg, lastErr)
 	p.setCur("")
@@ -703,29 +759,33 @@ func (s *Syncer) cleanupRetention(settings store.Settings) {
 	}
 	cutoff := time.Now().Unix() - int64(settings.RetentionD)*86400
 	removed := 0
-	for _, seg := range s.listStatus("done") {
-		if seg.Start >= cutoff || seg.Path == "" {
-			continue
+	// local_only rows have a local file too; omitting them leaked every file
+	// whose segment the NVR had already overwritten.
+	for _, status := range []string{"done", "local_only"} {
+		for _, seg := range s.listStatus(status) {
+			if seg.Start >= cutoff || seg.Path == "" {
+				continue
+			}
+			abs, ok := pathUnderStorage(settings.StorageDir, seg.Path)
+			if !ok {
+				s.st.Log("warn", "scan", fmt.Sprintf("保留清理跳过越界路径: %q", seg.Path))
+				continue
+			}
+			if err := os.Remove(abs); err != nil && !errors.Is(err, os.ErrNotExist) {
+				s.st.Log("warn", "scan", fmt.Sprintf("删除过期文件 %s 失败: %v", seg.Path, err))
+				continue
+			}
+			if err := os.Remove(abs + ".json"); err != nil && !errors.Is(err, os.ErrNotExist) {
+				s.st.Log("warn", "scan", fmt.Sprintf("删除 sidecar %s.json 失败: %v", seg.Path, err))
+			}
+			if err := s.st.UpsertSegment(store.Segment{
+				Ch: seg.Ch, Start: seg.Start, End: seg.End,
+				Status: "skipped", Err: "retention: expired",
+			}); err != nil {
+				s.st.Log("warn", "scan", fmt.Sprintf("标记过期段失败: %v", err))
+			}
+			removed++
 		}
-		abs, ok := pathUnderStorage(settings.StorageDir, seg.Path)
-		if !ok {
-			s.st.Log("warn", "scan", fmt.Sprintf("保留清理跳过越界路径: %q", seg.Path))
-			continue
-		}
-		if err := os.Remove(abs); err != nil && !errors.Is(err, os.ErrNotExist) {
-			s.st.Log("warn", "scan", fmt.Sprintf("删除过期文件 %s 失败: %v", seg.Path, err))
-			continue
-		}
-		if err := os.Remove(abs + ".json"); err != nil && !errors.Is(err, os.ErrNotExist) {
-			s.st.Log("warn", "scan", fmt.Sprintf("删除 sidecar %s.json 失败: %v", seg.Path, err))
-		}
-		if err := s.st.UpsertSegment(store.Segment{
-			Ch: seg.Ch, Start: seg.Start, End: seg.End,
-			Status: "skipped", Err: "retention: expired",
-		}); err != nil {
-			s.st.Log("warn", "scan", fmt.Sprintf("标记过期段失败: %v", err))
-		}
-		removed++
 	}
 	if removed > 0 {
 		s.st.Log("info", "scan", fmt.Sprintf("保留清理：删除 %d 个过期文件（%d 天）", removed, settings.RetentionD))
@@ -809,7 +869,9 @@ func syncCutoff(settings store.Settings, now int64) int64 {
 		if days < 1 {
 			days = 1
 		}
-		return midnight - int64(days)*86400
+		// Use calendar days rather than 86400 seconds so a DST transition
+		// does not shift the cutoff by an hour.
+		return time.Date(local.Year(), local.Month(), local.Day()-days, 0, 0, 0, 0, time.Local).Unix()
 	default:
 		return latest
 	}
@@ -1106,10 +1168,13 @@ func (s *Syncer) refreshCatalogDays(ctx context.Context, force, allowRunning boo
 		}
 		segs = dropCoveredClips(segs)
 
-		known := map[segKey]bool{}
-		for _, status := range []string{"pending", "syncing", "done", "failed"} {
+		// Keep the status of known rows: a skipped row may become eligible
+		// once the cutoff moves, but it must not be counted as "new" on every
+		// hourly refresh (which also caused thousands of pointless upserts).
+		known := map[segKey]store.Segment{}
+		for _, status := range []string{"pending", "syncing", "done", "failed", "skipped"} {
 			for _, old := range s.listChannel(ch, status) {
-				known[segKey{old.Ch, old.Start, old.End}] = true
+				known[segKey{old.Ch, old.Start, old.End}] = old
 			}
 		}
 
@@ -1117,7 +1182,17 @@ func (s *Syncer) refreshCatalogDays(ctx context.Context, force, allowRunning boo
 		for _, ms := range segs {
 			present = append(present, ms)
 			key := segKey{ch, ms.Start, ms.End}
-			if known[key] {
+			if old, ok := known[key]; ok {
+				if old.Status == "skipped" && shouldPromoteSkipped(old, ms, cutoff) {
+					seg := store.Segment{
+						Ch: ch, Start: ms.Start, End: ms.End,
+						Size: ms.Size, EventType: ms.EventType, Status: "pending",
+					}
+					if err := s.st.UpsertSegment(seg); err == nil {
+						known[key] = seg
+						res.Promoted++
+					}
+				}
 				continue
 			}
 			seg := store.Segment{Ch: ch, Start: ms.Start, End: ms.End, Size: ms.Size, EventType: ms.EventType}
@@ -1134,7 +1209,7 @@ func (s *Syncer) refreshCatalogDays(ctx context.Context, force, allowRunning boo
 			if err := s.st.UpsertSegment(seg); err != nil {
 				continue
 			}
-			known[key] = true
+			known[key] = seg
 			res.Added++
 		}
 
@@ -1171,16 +1246,36 @@ func (s *Syncer) refreshCatalogDays(ctx context.Context, force, allowRunning boo
 		}
 		res.Listed += len(present)
 	}
-	s.st.Log("info", "catalog", fmt.Sprintf("对账完成：NVR 上 %d 段，新增 %d，转为仅本地 %d，标记丢失 %d",
-		res.Listed, res.Added, res.BecameLocal, res.MarkedGone))
+	if settings.RetentionD > 0 {
+		// Retention used to run only after a successful sync, so a deployment
+		// with auto-sync disabled never deleted anything.
+		s.cleanupRetention(settings)
+	}
+	s.st.Log("info", "catalog", fmt.Sprintf("对账完成：NVR 上 %d 段，新增 %d，恢复 %d，转为仅本地 %d，标记丢失 %d",
+		res.Listed, res.Added, res.Promoted, res.BecameLocal, res.MarkedGone))
 	s.catalogLast = res
 	return res, nil
+}
+
+// shouldPromoteSkipped reports whether an existing skipped row should be
+// queued again for download because the NVR still has it and the current
+// cutoff now allows it. Rows skipped by retention or with an empty time range
+// stay skipped.
+func shouldPromoteSkipped(old store.Segment, ms nvr.MediaSeg, cutoff int64) bool {
+	if ms.End <= ms.Start || ms.End > cutoff {
+		return false
+	}
+	if strings.HasPrefix(old.Err, "retention:") || old.Err == "empty time range" {
+		return false
+	}
+	return true
 }
 
 // CatalogResult summarises one catalogue refresh.
 type CatalogResult struct {
 	Listed      int `json:"listed"`
 	Added       int `json:"added"`
+	Promoted    int `json:"promoted"`
 	BecameLocal int `json:"became_local"`
 	MarkedGone  int `json:"marked_gone"`
 }

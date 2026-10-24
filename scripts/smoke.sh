@@ -5,7 +5,7 @@ BIN=${BIN:-./nvrsync}
 ADDR=${ADDR:-http://127.0.0.1:18099}
 DATA=${DATA:-/tmp/nvrsync-smoke}
 NVR=${NVR:-192.168.0.49:8000}
-PASS=${PASS:-ad123min}
+: "${PASS:?PASS must be set to the NVR administrator password}"
 CH=${CH:-1}
 DURATION=${DURATION:-120}
 

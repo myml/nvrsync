@@ -222,46 +222,70 @@ func (c *Client) loginAt(base string) (string, error) {
 // GetUserID returns system.get_user_id for the current login session. The
 // value is a media session id (not a stable account id) and must be passed
 // to download as client_id, so it is cached until the next Login.
+//
+// The NVR answers -40401 when it has no session budget left. That is
+// transient and should be retried with a fresh login instead of turning every
+// queued download into a permanent "failed" row.
 func (c *Client) GetUserID() (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.stok == "" {
-		if err := c.loginLocked(); err != nil {
-			return 0, err
+
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * time.Second)
 		}
-	}
-	if c.userID > 0 {
+		if c.stok == "" {
+			if err := c.loginLocked(); err != nil {
+				lastErr = err
+				continue
+			}
+		}
+		if c.userID > 0 {
+			return c.userID, nil
+		}
+		raw, err := c.callLocked(map[string]any{
+			"system": map[string]any{"get_user_id": nil},
+			"method": "do",
+		})
+		if err != nil {
+			lastErr = err
+			c.stok = ""
+			continue
+		}
+		var r struct {
+			UserID    int `json:"user_id"`
+			ErrorCode int `json:"error_code"`
+			System    struct {
+				UserID int `json:"get_user_id"`
+			} `json:"system"`
+		}
+		if err := json.Unmarshal(raw, &r); err != nil {
+			return 0, fmt.Errorf("get_user_id: bad response: %w (raw %.200s)", err, raw)
+		}
+		if r.ErrorCode == -40401 {
+			lastErr = fmt.Errorf("get_user_id: error_code=%d (NVR busy)", r.ErrorCode)
+			c.stok = ""
+			c.userID = 0
+			continue
+		}
+		if r.ErrorCode != 0 {
+			return 0, fmt.Errorf("get_user_id: error_code=%d", r.ErrorCode)
+		}
+		switch {
+		case r.UserID > 0:
+			c.userID = r.UserID
+		case r.System.UserID > 0:
+			c.userID = r.System.UserID
+		default:
+			return 0, fmt.Errorf("get_user_id: no user_id in response (raw %.200s)", raw)
+		}
 		return c.userID, nil
 	}
-	raw, err := c.callLocked(map[string]any{
-		"system": map[string]any{"get_user_id": nil},
-		"method": "do",
-	})
-	if err != nil {
-		return 0, err
+	if lastErr == nil {
+		lastErr = errors.New("get_user_id: no attempt made")
 	}
-	var r struct {
-		UserID    int `json:"user_id"`
-		ErrorCode int `json:"error_code"`
-		System    struct {
-			UserID int `json:"get_user_id"`
-		} `json:"system"`
-	}
-	if err := json.Unmarshal(raw, &r); err != nil {
-		return 0, fmt.Errorf("get_user_id: bad response: %w (raw %.200s)", err, raw)
-	}
-	if r.ErrorCode != 0 {
-		return 0, fmt.Errorf("get_user_id: error_code=%d", r.ErrorCode)
-	}
-	switch {
-	case r.UserID > 0:
-		c.userID = r.UserID
-	case r.System.UserID > 0:
-		c.userID = r.System.UserID
-	default:
-		return 0, fmt.Errorf("get_user_id: no user_id in response (raw %.200s)", raw)
-	}
-	return c.userID, nil
+	return 0, fmt.Errorf("get_user_id after retries: %w", lastErr)
 }
 
 func (c *Client) callLocked(v any) (json.RawMessage, error) {

@@ -63,9 +63,9 @@ func New(st *store.Store, sy *syncer.Syncer, pl *play.Player, assets fs.FS, ver 
 		assets = web.Sub()
 	}
 	s := &server{st: st, sy: sy, pl: pl, assets: assets, ver: ver, auth: newAuthManager()}
-	// Logging/panic recovery stays outermost; authentication runs before any
-	// business handler.
-	return withMiddleware(s.authMiddleware(s.routes()))
+	// Headers and compression wrap everything; logging/panic recovery stays
+	// next; authentication runs before any business handler.
+	return withSecurityHeaders(withCompression(withMiddleware(s.authMiddleware(s.routes()))))
 }
 
 // routes registers every endpoint from ARCH.md.
@@ -128,8 +128,23 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// settingsResponse is the public shape of Settings. The NVR password is never
+// returned: nvr_pass_set tells the UI whether a password is stored, and an
+// empty nvr_pass on PUT means "keep the current password".
+type settingsResponse struct {
+	store.Settings
+	NVRPassSet bool `json:"nvr_pass_set"`
+}
+
+func (s *server) publicSettings() settingsResponse {
+	set := s.st.Settings()
+	hasPassword := set.NVRPass != ""
+	set.NVRPass = ""
+	return settingsResponse{Settings: set, NVRPassSet: hasPassword}
+}
+
 func (s *server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
-	writeOK(w, http.StatusOK, s.st.Settings())
+	writeOK(w, http.StatusOK, s.publicSettings())
 }
 
 func (s *server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
@@ -137,6 +152,12 @@ func (s *server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 	if err := decodeJSON(w, r, &in, false); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid settings: "+err.Error())
 		return
+	}
+	before := s.st.Settings()
+	// The API never returns nvr_pass, so an empty value means "unchanged".
+	// Clearing the NVR password is not a supported operation.
+	if in.NVRPass == "" {
+		in.NVRPass = before.NVRPass
 	}
 	// Settings() strips the hash, so the frontend never sends it back. Enabling
 	// login without a stored password would lock everyone out.
@@ -151,7 +172,6 @@ func (s *server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	before := s.st.Settings()
 	if err := s.st.SaveSettings(in); err != nil {
 		writeError(w, http.StatusInternalServerError, "save settings: "+err.Error())
 		return
@@ -172,7 +192,7 @@ func (s *server) handlePutSettings(w http.ResponseWriter, r *http.Request) {
 	// Nothing to restart: the syncer reads the latest settings from the store
 	// at the start of every loop iteration and before each download.
 	s.st.Log("info", "settings", "settings updated")
-	writeOK(w, http.StatusOK, saved)
+	writeOK(w, http.StatusOK, s.publicSettings())
 }
 
 // validateSettings rejects values that would make the syncer loop misbehave.
@@ -185,11 +205,30 @@ func validateSettings(v store.Settings) error {
 		return fmt.Errorf("auto_minutes must not be negative")
 	case v.RetentionD < 0:
 		return fmt.Errorf("retention_days must not be negative")
+	case v.CutoffDays < 0:
+		return fmt.Errorf("cutoff_days must not be negative")
+	case v.CatalogDays < 0:
+		return fmt.Errorf("catalog_days must not be negative")
+	case v.CatalogMinutes < 0:
+		return fmt.Errorf("catalog_minutes must not be negative")
+	}
+	switch strings.TrimSpace(v.Cutoff) {
+	case "", "latest", "yesterday", "days":
+	default:
+		return fmt.Errorf("cutoff must be one of latest, yesterday or days")
 	}
 	for _, ch := range v.Channels {
 		if ch <= 0 {
 			return fmt.Errorf("channels must contain positive channel numbers, got %d", ch)
 		}
+	}
+	for _, ch := range v.CatalogChannels {
+		if ch <= 0 {
+			return fmt.Errorf("catalog_channels must contain positive channel numbers, got %d", ch)
+		}
+	}
+	if len(v.Channels) > 64 || len(v.CatalogChannels) > 64 {
+		return fmt.Errorf("at most 64 channels may be configured")
 	}
 	if user := strings.TrimSpace(v.AuthUser); len(user) > 64 || strings.ContainsAny(user, "\r\n\t") {
 		return fmt.Errorf("auth_user must be at most 64 characters and contain no control characters")
@@ -627,9 +666,19 @@ func withMiddleware(next http.Handler) http.Handler {
 					writeError(rec, http.StatusInternalServerError, "internal server error")
 				}
 			}
-			log.Printf("%s %s -> %d (%s)", r.Method, r.URL.RequestURI(), rec.status,
-				time.Since(start).Round(time.Microsecond))
+			elapsed := time.Since(start)
+			// Successful status polling, health checks and static files would
+			// otherwise drown every useful line in the container log.
+			if rec.status >= http.StatusBadRequest || elapsed > time.Second || !isQuietRequest(r) {
+				log.Printf("%s %s -> %d (%s)", r.Method, r.URL.RequestURI(), rec.status,
+					elapsed.Round(time.Microsecond))
+			}
 		}()
+
+		if crossOriginMutation(r) {
+			writeError(rec, http.StatusForbidden, "cross-origin request rejected")
+			return
+		}
 
 		next.ServeHTTP(rec, r)
 	})
@@ -685,6 +734,12 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // decodeJSON decodes a single JSON value from a size-limited body. Empty
 // bodies are accepted when allowEmpty is true (sync start takes optional JSON).
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any, allowEmpty bool) error {
+	// A non-JSON content type is a good sign of a cross-site form post. The
+	// browser JSON API always sends application/json.
+	if ct := strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0]); ct != "" &&
+		!strings.EqualFold(ct, "application/json") {
+		return errors.New("Content-Type must be application/json")
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(dst); err != nil {

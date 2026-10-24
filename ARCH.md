@@ -7,7 +7,7 @@ NVR 录像同步 + 在线按天回看。单二进制（Go + 内嵌前端），�
 ```
 cmd/nvrsync/main.go       入口：flag/env → config → store → syncer → api
 internal/config/config.go 配置结构 + 默认值 + 校验
-internal/store/store.go   JSON 持久化（segments / logs / settings / sync state）
+internal/store/store.go   设置 JSON + SQLite 持久化（segments / logs / sync state）
 internal/nvr/             NVR 协议客户端（/ds 管理 API + 8000 下载）
 internal/syncer/syncer.go 同步引擎（扫描→排队→下载→落盘→记账）
 internal/play/play.go     按天 HLS 播放列表 + 可选 ffmpeg 转码缓存
@@ -15,7 +15,7 @@ internal/api/api.go       HTTP API + go:embed web
 web/                      前端静态资源（内嵌）
 ```
 
-## 数据模型（JSON 文件，默认 `$DATA/store.json`）
+## 数据模型（设置存 `$DATA/config.json`，录像段/日志/同步状态存 `$DATA/nvrsync.db`）
 
 ```go
 type Segment struct {
@@ -103,7 +103,7 @@ func (p *Player) EnsureProxy(ch int, date string) error           // 可选 ffmp
 | POST | `/api/login` | `{user,password}` → `{ok:true}` + `nvrsync_session` Cookie；同一 IP 连续失败 5 次锁 60 秒 |
 | POST | `/api/logout` | 删除当前会话并清除 Cookie |
 | POST | `/api/auth/password` | `{user,old_password,new_password}`；未启用时可只设置，启用后必须验证旧密码；成功后重置全部会话 |
-| GET/PUT | `/api/settings` | 读/写设置；PUT 后立即生效；`auth_hash` 永远不会返回，启用登录前必须先设置密码 |
+| GET/PUT | `/api/settings` | 读/写设置；PUT 后立即生效；`auth_hash` 与 `nvr_pass` 永远不会返回，`nvr_pass_set` 表示是否已保存 NVR 密码；PUT 时 `nvr_pass` 留空表示沿用旧值；启用登录前必须先设置密码 |
 | POST | `/api/nvr/test` | 用当前设置登录+列一段，返回 ok/错误 |
 | POST | `/api/catalog/refresh` | 后台对账：把 NVR 仍在的录像合并进索引，NVR 已覆盖的标为 `local_only`，从没下过的标 `skipped` |
 | POST | `/api/nvr/scan` | `{channels,from,to}` 只列出 NVR 录像写入本地索引（不下载），超过截止时间的段标为 skipped |
@@ -132,7 +132,7 @@ func (p *Player) EnsureProxy(ch int, date string) error           // 可选 ffmp
 
 ```
 $DATA/
-  store.json                      # 元数据
+  nvrsync.db                      # SQLite：录像段/日志/同步状态
   rec/cam1/2026-10-21/07-00-00_08-00-00.ts
   rec/cam1/2026-10-21/07-00-00_08-00-00.ts.json   # sidecar
   cache/hls/cam1/2026-10-21/...                   # 转码缓存（可选）

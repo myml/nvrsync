@@ -584,3 +584,28 @@ func TestCollectQueueHonoursRange(t *testing.T) {
 		t.Fatalf("queue = %+v, want only the in-range segment", queue)
 	}
 }
+
+func TestShouldPromoteSkipped(t *testing.T) {
+	cutoff := int64(1000)
+	ms := nvr.MediaSeg{Start: 10, End: 20}
+	cases := []struct {
+		name string
+		old  store.Segment
+		ms   nvr.MediaSeg
+		want bool
+	}{
+		{"cutoff moved", store.Segment{Err: "晚于同步截止时间，暂不同步"}, ms, true},
+		{"nvr returned again", store.Segment{Err: "NVR 上已无此段"}, ms, true},
+		{"retention", store.Segment{Err: "retention: expired"}, ms, false},
+		{"empty range", store.Segment{Err: "empty time range"}, ms, false},
+		{"still too new", store.Segment{}, nvr.MediaSeg{Start: 10, End: 2000}, false},
+		{"invalid", store.Segment{}, nvr.MediaSeg{Start: 20, End: 20}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldPromoteSkipped(tc.old, tc.ms, cutoff); got != tc.want {
+				t.Errorf("shouldPromoteSkipped = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

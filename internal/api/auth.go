@@ -241,7 +241,7 @@ func (s *server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.auth.recordSuccess(ip)
-	s.setSessionCookie(w, token)
+	s.setSessionCookie(w, r, token)
 	s.st.Log("info", "auth", "login succeeded for "+strings.TrimSpace(req.User)+" from "+ip)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -251,7 +251,7 @@ func (s *server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if cookie, err := r.Cookie(sessionCookieName); err == nil {
 		s.auth.remove(cookie.Value)
 	}
-	s.clearSessionCookie(w)
+	s.clearSessionCookie(w, r)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -315,7 +315,7 @@ func (s *server) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
 
 	// Any session created with the old password is no longer valid.
 	s.auth.resetAll()
-	s.clearSessionCookie(w)
+	s.clearSessionCookie(w, r)
 	s.st.Log("info", "auth", "password updated for "+user)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -388,18 +388,19 @@ func isPublicRequest(r *http.Request) bool {
 	return false
 }
 
-func (s *server) setSessionCookie(w http.ResponseWriter, token string) {
+func (s *server) setSessionCookie(w http.ResponseWriter, r *http.Request, token string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    token,
 		Path:     "/",
 		MaxAge:   int(sessionTTL / time.Second),
 		HttpOnly: true,
+		Secure:   isHTTPS(r),
 		SameSite: http.SameSiteLaxMode,
 	})
 }
 
-func (s *server) clearSessionCookie(w http.ResponseWriter) {
+func (s *server) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",
@@ -407,6 +408,7 @@ func (s *server) clearSessionCookie(w http.ResponseWriter) {
 		MaxAge:   -1,
 		Expires:  time.Unix(0, 0),
 		HttpOnly: true,
+		Secure:   isHTTPS(r),
 		SameSite: http.SameSiteLaxMode,
 	})
 }
@@ -419,14 +421,30 @@ func sessionToken(r *http.Request) string {
 	return cookie.Value
 }
 
-// clientIP returns the remote IP without the port. X-Forwarded-For is
-// deliberately ignored: the rate limit must not be bypassable by a header.
+// clientIP returns the remote IP without the port. Behind traefik every
+// request has RemoteAddr=192.168.0.100, so using only RemoteAddr would let one
+// attacker lock every user out of the login form. The first X-Forwarded-For
+// hop is used when the immediate peer is private/loopback; a direct LAN client
+// could spoof it to bypass throttling, which is a much smaller problem than a
+// global denial of service.
 func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return strings.TrimSpace(r.RemoteAddr)
+	remote := strings.TrimSpace(r.RemoteAddr)
+	if host, _, err := net.SplitHostPort(remote); err == nil {
+		remote = host
 	}
-	return host
+	if ip := net.ParseIP(strings.Trim(remote, "[]")); ip != nil && (ip.IsLoopback() || ip.IsPrivate()) {
+		if forwarded := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-For"), ",")[0]); forwarded != "" {
+			if parsed := net.ParseIP(strings.TrimSpace(forwarded)); parsed != nil {
+				return parsed.String()
+			}
+		}
+		if real := strings.TrimSpace(r.Header.Get("X-Real-IP")); real != "" {
+			if parsed := net.ParseIP(real); parsed != nil {
+				return parsed.String()
+			}
+		}
+	}
+	return remote
 }
 
 // effectiveAuthUser returns the configured login name or the default.

@@ -10,10 +10,10 @@ TP-Link NVR 录像 → 本地/NAS 定时同步 + 按天在线回看。**单二�
 - **自动对账**：后台每 5 分钟把 NVR 当前持有的录像合并进列表；NVR 已覆盖但本地有文件的标为「仅本地」
 - **同步**：按通道、按时间段增量拉取 NVR 录像，实测可达 **45–52× 实时**（瓶颈是百兆网口）
 - **录像**：按天聚合，24 小时时间轴，点击即播（HLS，浏览器 hls.js）
-- **设置**：NVR 地址/账号、存储目录、通道、自动同步、保留策略、同步截止、转码开关
+- **设置**：NVR 地址/账号、存储目录、通道、自动同步、保留策略、同步截止；转码开关目前是预留项（尚未实现）
 - **账户安全**：可选的登录保护（默认关闭），bcrypt 密码、24h 会话、失败限速；忘记密码可用 `-reset-auth` 恢复
 - **同步截止**：可选「最新 / 昨天 / N 天前」，只同步已封盘录像，不会碰到正在写入的段
-- **零依赖**：前端资源 `go:embed` 进二进制；元数据 JSON 原子写，sidecar 随录像落盘
+- **零依赖**：前端资源 `go:embed` 进二进制；设置 JSON 原子写，录像段/日志/同步状态存 SQLite，sidecar 随录像落盘
 
 [![docker](https://github.com/myml/nvrsync/actions/workflows/docker.yml/badge.svg)](https://github.com/myml/nvrsync/actions/workflows/docker.yml)
 
@@ -51,6 +51,8 @@ go build -o nvrsync ./cmd/nvrsync
 
 环境变量：`NVRSYNC_LISTEN`、`NVRSYNC_DATA`。
 
+`GET /api/settings` 不会回显 NVR 密码，只返回 `nvr_pass_set`；保存时 `nvr_pass` 留空表示沿用已保存的密码。
+
 ### 登录保护（默认关闭）
 
 在「设置 → 账户安全」里先设置密码，再打开「启用登录保护」并保存；之后访问页面需要登录。
@@ -69,7 +71,7 @@ data/
   nvrsync.db                     # SQLite：录像段、日志、同步状态
   rec/cam1/2026-10-21/07-00-00_08-00-00.ts        # 录像
   rec/cam1/2026-10-21/07-00-00_08-00-00.ts.json   # sidecar
-  cache/hls/...                  # 转码缓存（可选）
+  cache/hls/...                  # 转码缓存（预留）
 ```
 
 ## 状态

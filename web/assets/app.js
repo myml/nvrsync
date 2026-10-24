@@ -310,14 +310,29 @@
       init.body = typeof opts.body === 'string' ? opts.body : JSON.stringify(opts.body);
     }
 
+    // A hung request must not keep pollBusy true forever. AbortController is
+    // supported by every browser that can run hls.js.
+    var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    var timeoutMs = Number(opts.timeout) > 0 ? Number(opts.timeout) : 15000;
+    var timer = null;
+    if (controller) {
+      init.signal = controller.signal;
+      timer = setTimeout(function () { controller.abort(); }, timeoutMs);
+    }
+
     var response;
     try {
       response = await fetch(path, init);
     } catch (err) {
-      var netError = '网络错误：' + (err && err.message ? err.message : String(err));
+      if (timer) clearTimeout(timer);
+      var timedOut = err && err.name === 'AbortError';
+      var netError = timedOut
+        ? '请求超时（' + Math.round(timeoutMs / 1000) + ' 秒）'
+        : '网络错误：' + (err && err.message ? err.message : String(err));
       if (!opts.quiet) toast(netError, 'error');
       return { ok: false, error: netError, status: 0 };
     }
+    if (timer) clearTimeout(timer);
 
     // 401 统一交给登录页处理，不在这里弹 toast，避免每个轮询 / 请求各弹一条。
     if (response.status === 401) {
@@ -583,7 +598,9 @@
     return {
       nvr_host: typeof raw.nvr_host === 'string' ? raw.nvr_host : '',
       nvr_user: typeof raw.nvr_user === 'string' ? raw.nvr_user : '',
+      // nvr_pass is never returned by the API; only whether one is stored.
       nvr_pass: typeof raw.nvr_pass === 'string' ? raw.nvr_pass : '',
+      nvr_pass_set: !!raw.nvr_pass_set,
       admin_port: toInt(raw.admin_port, 80),
       storage_dir: typeof raw.storage_dir === 'string' ? raw.storage_dir : '',
       channels: channels,
@@ -611,6 +628,27 @@
 
   var pollTimer = null;
   var pollBusy = false;
+
+  // Poll quickly while a sync is running and back off when idle. The previous
+  // fixed 2s interval produced ~43k requests/day per open tab.
+  function nextPollDelay() {
+    if (document.visibilityState === 'hidden') return 30000;
+    return state.sync && state.sync.running ? 2000 : 10000;
+  }
+
+  function schedulePoll(delay) {
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = setTimeout(runPoll, Math.max(0, Number(delay) || 0));
+  }
+
+  async function runPoll() {
+    pollTimer = null;
+    try {
+      await pollStatus();
+    } finally {
+      schedulePoll(nextPollDelay());
+    }
+  }
 
   function updateIndicator() {
     var indicator = document.getElementById('sync-indicator');
@@ -692,12 +730,17 @@
   }
 
   function startStatusPolling() {
-    if (!pollTimer) pollTimer = setInterval(pollStatus, 2000);
-    pollStatus();
+    if (pollTimer) return;
+    schedulePoll(0);
   }
 
   document.addEventListener('visibilitychange', function () {
-    if (document.visibilityState === 'visible') pollStatus();
+    if (document.visibilityState === 'visible') {
+      schedulePoll(0);
+    } else if (pollTimer) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
   });
 
   /* ========================================================================
@@ -966,7 +1009,7 @@
   /** 后台对账：把 NVR 当前持有的录像同步进本地索引（只列不下载）。 */
   async function refreshCatalog(view, opts) {
     var force = !!(opts && opts.force);
-    var res = await api('/api/catalog/refresh' + (force ? '?force=1' : ''), { method: 'POST', quiet: true });
+    var res = await api('/api/catalog/refresh' + (force ? '?force=1' : ''), { method: 'POST', quiet: true, timeout: 190000 });
     if (res.ok && res.data && res.data.skipped) {
       if (opts && opts.loud) toast('对账正在进行，本次已跳过', 'info');
       return res;
@@ -1174,7 +1217,7 @@
         actionCell.appendChild(retry);
       } else if (seg.status === 'syncing') {
         actionCell.appendChild(button('同步中', { sm: true, disabled: true }));
-      } else if (seg.status === 'done') {
+      } else if (seg.status === 'done' || seg.status === 'local_only') {
         actionCell.appendChild(el('a', {
           class: 'btn btn-sm btn-ghost',
           href: '#/recordings/' + seg.ch + '/' + isoDateFromUnix(start),
@@ -1726,11 +1769,55 @@
         }));
       }
 
-      function setupPlayer() {
-        var src = playlistURL();
-        var HlsCtor = window.Hls;
+      // hls.js is ~600 KB and is only useful on the player page, so load it
+      // lazily instead of blocking every page load.
+      var hlsScriptPromise = null;
+      function loadHlsScript() {
+        if (window.Hls) return Promise.resolve(window.Hls);
+        if (hlsScriptPromise) return hlsScriptPromise;
+        hlsScriptPromise = new Promise(function (resolve, reject) {
+          var script = document.createElement('script');
+          script.src = '/assets/vendor/hls.min.js';
+          script.async = true;
+          script.onload = function () {
+            if (window.Hls) resolve(window.Hls);
+            else {
+              hlsScriptPromise = null;
+              reject(new Error('hls.js 未初始化'));
+            }
+          };
+          script.onerror = function () {
+            hlsScriptPromise = null;
+            reject(new Error('加载 hls.js 失败'));
+          };
+          document.head.appendChild(script);
+        });
+        return hlsScriptPromise;
+      }
 
-        if (HlsCtor && typeof HlsCtor.isSupported === 'function' && HlsCtor.isSupported()) {
+      async function setupPlayer() {
+        var src = playlistURL();
+        var nativeHls = !!video.canPlayType('application/vnd.apple.mpegurl');
+
+        // Safari can play HLS natively; avoid downloading hls.js there.
+        if (!nativeHls) {
+          showLoadingOverlay();
+          try {
+            await loadHlsScript();
+          } catch (err) {
+            if (view.destroyed) return;
+            showPlaybackError(
+              '播放器资源加载失败',
+              '无法加载本地 hls.js。请刷新页面重试，或直接用 VLC 打开下方播放列表地址。',
+              err && err.message ? String(err.message) : ''
+            );
+            return;
+          }
+          if (view.destroyed) return;
+        }
+
+        var HlsCtor = window.Hls;
+        if (!nativeHls && HlsCtor && typeof HlsCtor.isSupported === 'function' && HlsCtor.isSupported()) {
           try {
             var hls = new HlsCtor({
               enableWorker: true,
@@ -1792,7 +1879,7 @@
         }
 
         // Safari 原生 HLS。
-        if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        if (nativeHls) {
           video.src = src;
           var onMeta = function () {
             if (view.destroyed) return;
@@ -2026,7 +2113,7 @@
         });
 
         var done = all.filter(function (seg) {
-          return seg.status === 'done' && Number(seg.end) > Number(seg.start);
+          return (seg.status === 'done' || seg.status === 'local_only') && Number(seg.end) > Number(seg.start);
         });
 
         renderTimeline(all);
@@ -2048,7 +2135,11 @@
         }
 
         view.ctx = { segments: all, done: done, media: media };
-        setupPlayer();
+        setupPlayer().catch(function (err) {
+          if (view.destroyed) return;
+          console.error(err);
+          showPlaybackError('播放器初始化失败', '请刷新页面重试，或直接用 VLC 打开播放列表地址。', err && err.message ? String(err.message) : '');
+        });
       }
 
       refreshBtn.addEventListener('click', function () {
@@ -2162,8 +2253,9 @@
     });
 
     var passInput = el('input', {
-      class: 'control', id: 'set-pass', type: 'password', value: saved.nvr_pass,
-      autocomplete: 'current-password'
+      class: 'control', id: 'set-pass', type: 'password', value: '',
+      placeholder: saved.nvr_pass_set ? '已保存，留空表示不修改' : '请输入 NVR 管理员密码',
+      autocomplete: 'new-password'
     });
 
     var eyeBtn = el('button', {
@@ -2334,7 +2426,12 @@
           hint: '管理 API 端口，通常为 80；0 表示自动尝试 80 / 8081 / 8080。'
         }),
         field('用户名', userInput, { id: 'set-user' }),
-        field('密码', el('div', { class: 'input-group' }, [passInput, eyeBtn]), { id: 'set-pass' }),
+        field('密码', el('div', { class: 'input-group' }, [passInput, eyeBtn]), {
+          id: 'set-pass',
+          hint: saved.nvr_pass_set
+            ? '出于安全考虑，服务端不会回显已保存的密码；留空保存表示继续使用原密码。'
+            : '首次配置时需要填写；保存后 API 不会回显。'
+        }),
         field('存储目录', storageInput, {
           id: 'set-storage',
           span: true,
@@ -2520,6 +2617,13 @@
         var normalized = normalizeSettings(res.data || settings);
         state.settings = normalized;
         state.channels = channelsFromSettings(normalized);
+        // The server intentionally never returns nvr_pass. Clear the field so
+        // the plaintext password does not linger in the DOM after saving.
+        if (passInput.value) {
+          saved.nvr_pass_set = true;
+          passInput.value = '';
+          passInput.placeholder = '已保存，留空表示不修改';
+        }
         markSaved();
         if (normalized.auth_enabled && !authWasEnabled) {
           // 登录保护刚开启：当前会话不属于登录状态，下一步请求会 401。

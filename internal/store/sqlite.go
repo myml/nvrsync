@@ -33,7 +33,10 @@ ON CONFLICT(ch, start_ts, end_ts) DO UPDATE SET
 	END
 `
 
-var schemaStatements = []string{
+// schemaTables must run before schemaIndexes: a database created by an older
+// build can have a logs table without the ch column, and creating the ch index
+// before the migration would fail.
+var schemaTables = []string{
 	`CREATE TABLE IF NOT EXISTS segments (
 		ch         INTEGER NOT NULL,
 		start_ts   INTEGER NOT NULL,
@@ -47,9 +50,6 @@ var schemaStatements = []string{
 		err        TEXT    NOT NULL DEFAULT '',
 		PRIMARY KEY (ch, start_ts, end_ts)
 	)`,
-	`CREATE INDEX IF NOT EXISTS idx_segments_status ON segments(status)`,
-	`CREATE INDEX IF NOT EXISTS idx_segments_start ON segments(start_ts, ch, end_ts)`,
-	`CREATE INDEX IF NOT EXISTS idx_segments_end ON segments(end_ts)`,
 	`CREATE TABLE IF NOT EXISTS logs (
 		id    INTEGER PRIMARY KEY AUTOINCREMENT,
 		ts    INTEGER NOT NULL,
@@ -58,12 +58,18 @@ var schemaStatements = []string{
 		ch    INTEGER NOT NULL DEFAULT 0,
 		msg   TEXT    NOT NULL
 	)`,
-	`CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level, id DESC)`,
-	`CREATE INDEX IF NOT EXISTS idx_logs_ch ON logs(ch, id DESC)`,
 	`CREATE TABLE IF NOT EXISTS sync_state (
 		id   INTEGER PRIMARY KEY CHECK (id = 1),
 		data TEXT    NOT NULL
 	)`,
+}
+
+var schemaIndexes = []string{
+	`CREATE INDEX IF NOT EXISTS idx_segments_status ON segments(status)`,
+	`CREATE INDEX IF NOT EXISTS idx_segments_start ON segments(start_ts, ch, end_ts)`,
+	`CREATE INDEX IF NOT EXISTS idx_segments_end ON segments(end_ts)`,
+	`CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level, id DESC)`,
+	`CREATE INDEX IF NOT EXISTS idx_logs_ch ON logs(ch, id DESC)`,
 }
 
 // openDB opens (or creates) the SQLite database and makes sure the schema is
@@ -104,9 +110,19 @@ func openDB(path string) (*sql.DB, error) {
 }
 
 func initSchema(db *sql.DB) error {
-	for _, stmt := range schemaStatements {
+	for _, stmt := range schemaTables {
 		if _, err := db.Exec(stmt); err != nil {
-			return fmt.Errorf("store: create schema: %w", err)
+			return fmt.Errorf("store: create table: %w", err)
+		}
+	}
+	// Additive migrations must run before the indexes: an old logs table does
+	// not have the ch column yet.
+	if err := migrate(db); err != nil {
+		return fmt.Errorf("store: migrate schema: %w", err)
+	}
+	for _, stmt := range schemaIndexes {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("store: create index: %w", err)
 		}
 	}
 	return nil
