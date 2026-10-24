@@ -14,9 +14,11 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/myml/nvrsync/internal/nvr"
@@ -46,23 +48,35 @@ var (
 
 // server holds the dependencies shared by all handlers.
 type server struct {
-	st     *store.Store
-	sy     *syncer.Syncer
-	pl     *play.Player
-	assets fs.FS
-	ver    string
-	auth   *authManager
+	st        *store.Store
+	sy        *syncer.Syncer
+	pl        *play.Player
+	assets    fs.FS
+	ver       string
+	commit    string
+	buildDate string
+	auth      *authManager
 }
 
 // New returns the complete HTTP handler: JSON API, media files and the SPA.
 //
 // assets is the frontend filesystem (normally web.Sub()). Passing nil uses the
 // assets embedded in the binary, which is what production does.
-func New(st *store.Store, sy *syncer.Syncer, pl *play.Player, assets fs.FS, ver string) http.Handler {
+func New(st *store.Store, sy *syncer.Syncer, pl *play.Player, assets fs.FS, ver string, build ...string) http.Handler {
 	if assets == nil {
 		assets = web.Sub()
 	}
-	s := &server{st: st, sy: sy, pl: pl, assets: assets, ver: ver, auth: newAuthManager()}
+	commit, buildDate := "", ""
+	if len(build) > 0 {
+		commit = build[0]
+	}
+	if len(build) > 1 {
+		buildDate = build[1]
+	}
+	s := &server{
+		st: st, sy: sy, pl: pl, assets: assets, ver: ver,
+		commit: commit, buildDate: buildDate, auth: newAuthManager(),
+	}
 	// Headers and compression wrap everything; logging/panic recovery stays
 	// next; authentication runs before any business handler.
 	return withSecurityHeaders(withCompression(withMiddleware(s.authMiddleware(s.routes()))))
@@ -73,6 +87,7 @@ func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/health", s.handleHealth)
+	mux.HandleFunc("GET /api/ready", s.handleReady)
 	mux.HandleFunc("GET /api/settings", s.handleGetSettings)
 	mux.HandleFunc("PUT /api/settings", s.handlePutSettings)
 
@@ -112,20 +127,66 @@ func (s *server) routes() http.Handler {
 
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// The documented response is {ok,version}; keep the version both at the
-	// top level (ARCH.md table) and under data (generic envelope).
+	// top level (ARCH.md table) and under data (generic envelope). Commit and
+	// build_date make it possible to tell which image is actually running.
+	type healthData struct {
+		Version   string `json:"version"`
+		Commit    string `json:"commit,omitempty"`
+		BuildDate string `json:"build_date,omitempty"`
+		GoVersion string `json:"go_version"`
+	}
+	data := healthData{Version: s.ver, Commit: s.commit, BuildDate: s.buildDate, GoVersion: runtime.Version()}
 	writeJSON(w, http.StatusOK, struct {
-		OK      bool   `json:"ok"`
-		Version string `json:"version"`
-		Data    struct {
-			Version string `json:"version"`
-		} `json:"data"`
+		OK        bool       `json:"ok"`
+		Version   string     `json:"version"`
+		Commit    string     `json:"commit,omitempty"`
+		BuildDate string     `json:"build_date,omitempty"`
+		Data      healthData `json:"data"`
 	}{
-		OK:      true,
-		Version: s.ver,
-		Data: struct {
-			Version string `json:"version"`
-		}{Version: s.ver},
+		OK: true, Version: s.ver, Commit: s.commit, BuildDate: s.buildDate, Data: data,
 	})
+}
+
+// handleReady is the readiness probe: the process is only useful if SQLite is
+// reachable and (when configured) the storage directory is mounted. The NVR is
+// deliberately not part of it: the service can still serve existing footage
+// while the device is offline.
+func (s *server) handleReady(w http.ResponseWriter, r *http.Request) {
+	dbErr := s.st.Ping()
+	set := s.st.Settings()
+	storageDir := strings.TrimSpace(set.StorageDir)
+	storageOK := true
+	var free, total int64
+	if storageDir != "" {
+		var fs syscall.Statfs_t
+		if err := syscall.Statfs(storageDir, &fs); err != nil {
+			storageOK = false
+		} else {
+			free = int64(fs.Bavail) * int64(fs.Bsize)
+			total = int64(fs.Blocks) * int64(fs.Bsize)
+		}
+	}
+	ready := dbErr == nil && storageOK
+	body := map[string]any{
+		"ready":         ready,
+		"db":            dbErr == nil,
+		"storage":       storageOK,
+		"version":       s.ver,
+		"commit":        s.commit,
+		"build_date":    s.buildDate,
+		"storage_free":  free,
+		"storage_total": total,
+	}
+	if dbErr != nil {
+		body["db_error"] = dbErr.Error()
+	}
+	if !ready {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"ok": false, "error": "not ready", "data": body,
+		})
+		return
+	}
+	writeOK(w, http.StatusOK, body)
 }
 
 // settingsResponse is the public shape of Settings. The NVR password is never
@@ -531,18 +592,33 @@ func (s *server) handleMedia(w http.ResponseWriter, r *http.Request) {
 	// decide: raw NVR segments are always MPEG-TS.
 	w.Header().Set("Content-Type", "video/mp2t")
 	w.Header().Set("Cache-Control", "public, max-age=86400")
+	if info, err := os.Stat(full); err == nil {
+		w.Header().Set("ETag", fmt.Sprintf(`"%x-%x"`, info.ModTime().UnixNano(), info.Size()))
+	}
 	// ServeFile supports Range/If-Range/If-Modified-Since, which hls.js and
 	// Safari rely on for seeking inside an hour-long segment.
 	http.ServeFile(w, r, full)
 }
 
 // resolveMedia maps a validated (ch, date, file) triple to an absolute local
-// path. Recorded segment metadata is preferred because it is authoritative for
-// where the syncer actually wrote the file; the canonical layout
-// (<storage>/rec/camN/<date>/<file>) is used as a fallback.
+// path. The syncer always writes the canonical layout
+// (<storage>/rec/camN/<date>/<file>), so that is checked first; the metadata
+// lookup remains as a fallback for legacy or custom paths.
 func (s *server) resolveMedia(ch int, date, file string) (string, bool) {
 	set := s.st.Settings()
 	root := strings.TrimSpace(set.StorageDir)
+
+	if root != "" {
+		for _, rel := range []string{
+			filepath.Join("rec", fmt.Sprintf("cam%d", ch), date, file),
+			filepath.Join(fmt.Sprintf("cam%d", ch), date, file),
+		} {
+			candidate, ok := joinUnderRoot(root, rel)
+			if ok && regularFile(candidate) {
+				return candidate, true
+			}
+		}
+	}
 
 	from, to := dayBounds(date)
 	if from != 0 {
@@ -572,18 +648,6 @@ func (s *server) resolveMedia(ch int, date, file string) (string, bool) {
 		}
 	}
 
-	if root == "" {
-		return "", false
-	}
-	for _, rel := range []string{
-		filepath.Join("rec", fmt.Sprintf("cam%d", ch), date, file),
-		filepath.Join(fmt.Sprintf("cam%d", ch), date, file),
-	} {
-		candidate, ok := joinUnderRoot(root, rel)
-		if ok && regularFile(candidate) {
-			return candidate, true
-		}
-	}
 	return "", false
 }
 
@@ -645,6 +709,13 @@ func (s *server) assetHandler() http.Handler {
 			w.Header().Set("Cache-Control", "public, max-age=86400")
 		} else {
 			w.Header().Set("Cache-Control", "no-cache")
+		}
+		if etag, ok := s.assetETag(r.URL.Path); ok {
+			w.Header().Set("ETag", etag)
+			if etagMatches(r.Header.Get("If-None-Match"), etag) {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
 		}
 		fileServer.ServeHTTP(w, r)
 	})

@@ -52,6 +52,7 @@ go build -o nvrsync ./cmd/nvrsync
 环境变量：`NVRSYNC_LISTEN`、`NVRSYNC_DATA`。
 
 `GET /api/settings` 不会回显 NVR 密码，只返回 `nvr_pass_set`；保存时 `nvr_pass` 留空表示沿用已保存的密码。
+`GET /api/health` 返回 `version`、`commit`、`build_date`；`GET /api/ready` 额外检查 SQLite 与存储目录。
 
 ### 登录保护（默认关闭）
 

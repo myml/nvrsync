@@ -2,6 +2,8 @@
 FROM golang:1.26-alpine AS build
 WORKDIR /src
 ARG VERSION=dev
+ARG COMMIT=dev
+ARG BUILD_DATE=unknown
 
 # Dependencies first so source edits do not invalidate the module cache.
 COPY go.mod go.sum* ./
@@ -9,7 +11,7 @@ RUN go mod download
 
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath \
-    -ldflags "-s -w -X main.Version=${VERSION}" \
+    -ldflags "-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
     -o /out/nvrsync ./cmd/nvrsync
 
 FROM alpine:3.20

@@ -22,54 +22,37 @@ type Stats struct {
 }
 
 // Stats returns the dashboard aggregate, optionally limited to one channel.
+// It intentionally uses one conditional-aggregation query: the previous
+// implementation issued five separate full scans (one per status group plus
+// MIN/MAX/SUM/COUNT(DISTINCT)).
 func (s *Store) Stats(ch int) Stats {
 	var st Stats
 
-	filter := ""
+	where := ""
 	args := []any{}
 	if ch > 0 {
-		filter = " WHERE ch = ?"
+		where = " WHERE ch = ?"
 		args = append(args, ch)
 	}
-
-	rows, err := s.db.Query("SELECT status, COUNT(*) FROM segments"+filter+" GROUP BY status", args...)
-	if err == nil {
-		for rows.Next() {
-			var status string
-			var n int
-			if err := rows.Scan(&status, &n); err != nil {
-				break
-			}
-			st.Total += n
-			switch status {
-			case "done":
-				st.Done += n
-			case "pending":
-				st.Pending += n
-			case "syncing":
-				st.Syncing += n
-			case "failed":
-				st.Failed += n
-			case "local_only":
-				st.LocalOnly += n
-			case "skipped":
-				st.Skipped += n
-			}
-		}
-		rows.Close()
-	}
-
-	where := " WHERE status IN ('done','local_only')"
-	args2 := []any{}
-	if ch > 0 {
-		where += " AND ch = ?"
-		args2 = append(args2, ch)
-	}
-	_ = s.db.QueryRow(`SELECT COALESCE(MIN(start_ts), 0), COALESCE(MAX(end_ts), 0)
-		FROM segments`+where, args2...).Scan(&st.Earliest, &st.Latest)
-	_ = s.db.QueryRow(`SELECT COALESCE(SUM(bytes), 0) FROM segments`+where, args2...).Scan(&st.Bytes)
-	_ = s.db.QueryRow(`SELECT COUNT(DISTINCT date(start_ts, 'unixepoch', 'localtime'))
-		FROM segments`+where, args2...).Scan(&st.Days)
+	_ = s.db.QueryRow(`SELECT
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'syncing' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'local_only' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END), 0),
+			COALESCE(MIN(CASE WHEN status IN ('done','local_only') THEN start_ts END), 0),
+			COALESCE(MAX(CASE WHEN status IN ('done','local_only') THEN end_ts END), 0),
+			COALESCE(SUM(CASE WHEN status IN ('done','local_only') THEN bytes ELSE 0 END), 0),
+			COUNT(DISTINCT CASE WHEN status IN ('done','local_only')
+				THEN date(start_ts, 'unixepoch', 'localtime') END)
+		FROM segments`+where,
+		args...,
+	).Scan(
+		&st.Total, &st.Done, &st.Pending, &st.Syncing, &st.Failed,
+		&st.LocalOnly, &st.Skipped, &st.Earliest, &st.Latest, &st.Bytes, &st.Days,
+	)
 
 	if dir := s.Settings().StorageDir; dir != "" {
 		var fs syscall.Statfs_t

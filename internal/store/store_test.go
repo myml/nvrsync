@@ -852,3 +852,79 @@ func TestSaveSettingsNormalizesChannels(t *testing.T) {
 		t.Errorf("CatalogChannels = %v, want %v", got.CatalogChannels, wantCatalog)
 	}
 }
+
+func TestDaysMergesOverlappingSegmentsPerChannel(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.FixedZone("test-utc+8", 8*3600)
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	s := openTestStore(t)
+	base := time.Date(2026, 10, 24, 0, 0, 0, 0, time.Local).Unix()
+	for _, seg := range []Segment{
+		{Ch: 1, Start: base + 10, End: base + 20, Status: "done", Bytes: 10},
+		{Ch: 2, Start: base + 10, End: base + 20, Status: "done", Bytes: 10},
+		{Ch: 1, Start: base + 15, End: base + 25, Status: "done", Bytes: 10},
+		{Ch: 1, Start: base + 30, End: base + 40, Status: "local_only", Bytes: 10},
+	} {
+		mustUpsert(t, s, seg)
+	}
+	days := s.Days(0)
+	if len(days) != 1 {
+		t.Fatalf("Days() = %+v", days)
+	}
+	// ch1 union = 10..25 (15s) + 30..40 (10s); ch2 = 10s => 35s.
+	if days[0].Seconds != 35 {
+		t.Errorf("Seconds = %d, want 35 (union per channel)", days[0].Seconds)
+	}
+	if days[0].Segments != 4 || days[0].Bytes != 40 || days[0].Chs != 2 {
+		t.Errorf("day = %+v", days[0])
+	}
+}
+
+func TestStatsSingleQuery(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.FixedZone("test-utc+8", 8*3600)
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	s := openTestStore(t)
+	base := time.Date(2026, 10, 24, 1, 0, 0, 0, time.Local).Unix()
+	for _, seg := range []Segment{
+		{Ch: 1, Start: base, End: base + 10, Status: "done", Bytes: 100},
+		{Ch: 2, Start: base, End: base + 20, Status: "local_only", Bytes: 50},
+		{Ch: 1, Start: base + 30, End: base + 40, Status: "pending", Bytes: 999},
+		{Ch: 1, Start: base + 50, End: base + 60, Status: "failed", Bytes: 999},
+		{Ch: 1, Start: base + 70, End: base + 80, Status: "skipped", Bytes: 999},
+	} {
+		mustUpsert(t, s, seg)
+	}
+	got := s.Stats(0)
+	if got.Total != 5 || got.Done != 1 || got.LocalOnly != 1 || got.Pending != 1 || got.Failed != 1 || got.Skipped != 1 {
+		t.Errorf("Stats() counts = %+v", got)
+	}
+	if got.Bytes != 150 || got.Earliest != base || got.Latest != base+20 || got.Days != 1 {
+		t.Errorf("Stats() aggregate = %+v", got)
+	}
+	if only := s.Stats(2); only.Total != 1 || only.Done != 0 || only.LocalOnly != 1 || only.Bytes != 50 {
+		t.Errorf("Stats(2) = %+v", only)
+	}
+}
+
+func TestQueueAndAllSegments(t *testing.T) {
+	s := openTestStore(t)
+	for _, seg := range []Segment{
+		{Ch: 1, Start: 1, End: 2, Status: "pending"},
+		{Ch: 1, Start: 3, End: 4, Status: "failed"},
+		{Ch: 2, Start: 5, End: 6, Status: "done"},
+		{Ch: 2, Start: 7, End: 8, Status: "syncing"},
+	} {
+		mustUpsert(t, s, seg)
+	}
+	q := s.QueueSegments([]int{1, 2}, []string{"pending", "failed", "syncing"})
+	if len(q) != 3 {
+		t.Fatalf("QueueSegments returned %d rows: %+v", len(q), q)
+	}
+	all := s.SegmentsAll(SegFilter{Ch: 2})
+	if len(all) != 2 {
+		t.Fatalf("SegmentsAll(ch=2) = %+v", all)
+	}
+}

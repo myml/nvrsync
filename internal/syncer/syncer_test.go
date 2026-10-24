@@ -609,3 +609,45 @@ func TestShouldPromoteSkipped(t *testing.T) {
 		})
 	}
 }
+
+func TestCleanupStaleParts(t *testing.T) {
+	dir := t.TempDir()
+	rec := filepath.Join(dir, "rec", "cam1", "2026-10-24")
+	if err := os.MkdirAll(rec, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	old := filepath.Join(rec, "old.ts.part")
+	fresh := filepath.Join(rec, "fresh.ts.part")
+	if err := os.WriteFile(old, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fresh, []byte("fresh"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(old, time.Now().Add(-2*time.Hour), time.Now().Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	st := openSyncerStore(t)
+	s := New(st)
+	s.cleanupStaleParts(dir)
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Errorf("old .part still exists: %v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("fresh .part was removed: %v", err)
+	}
+}
+
+func openSyncerStore(t *testing.T) *store.Store {
+	t.Helper()
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := st.Close(); err != nil {
+			t.Errorf("store.Close: %v", err)
+		}
+	})
+	return st
+}

@@ -454,28 +454,36 @@ func (s *Store) Logs(limit int, level string, ch int) []LogEntry {
 
 // Days aggregates successfully synced segments by local calendar day, newest
 // day first. A non-zero ch restricts the result to that channel.
+//
+// Seconds are the union of the playable intervals per channel, not the sum of
+// every row: a motion clip and the continuous recording containing it must not
+// make a day look twice as long. Bytes still sum every file because overlapping
+// segments really do occupy disk.
 func (s *Store) Days(ch int) []DayInfo {
 	type aggregate struct {
 		chs      map[int]struct{}
 		segments int
 		seconds  int64
 		bytes    int64
+		lastEnd  map[int]int64
 	}
-
-	query := "SELECT ch, start_ts, end_ts, bytes FROM segments WHERE status IN ('done', 'local_only')"
+	query := "SELECT ch, start_ts, end_ts, bytes FROM segments " +
+		"WHERE status IN ('done', 'local_only')"
 	args := []any{}
 	if ch != 0 {
 		query += " AND ch = ?"
 		args = append(args, ch)
 	}
+	// A single ordered scan lets us merge overlapping intervals in O(n).
+	query += " ORDER BY start_ts ASC, ch ASC, end_ts ASC"
 
-	days := make(map[string]*aggregate)
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return []DayInfo{}
 	}
 	defer rows.Close()
 
+	days := make(map[string]*aggregate)
 	for rows.Next() {
 		var (
 			segCh int
@@ -489,15 +497,28 @@ func (s *Store) Days(ch int) []DayInfo {
 		date := time.Unix(start, 0).In(time.Local).Format("2006-01-02")
 		agg := days[date]
 		if agg == nil {
-			agg = &aggregate{chs: make(map[int]struct{})}
+			agg = &aggregate{
+				chs:     make(map[int]struct{}),
+				lastEnd: make(map[int]int64),
+			}
 			days[date] = agg
 		}
 		agg.chs[segCh] = struct{}{}
 		agg.segments++
-		if d := end - start; d > 0 {
-			agg.seconds += d
-		}
 		agg.bytes += bytes
+		if end <= start {
+			continue
+		}
+		prevEnd := agg.lastEnd[segCh]
+		if start < prevEnd {
+			start = prevEnd
+		}
+		if end > start {
+			agg.seconds += end - start
+		}
+		if end > prevEnd {
+			agg.lastEnd[segCh] = end
+		}
 	}
 
 	out := make([]DayInfo, 0, len(days))
@@ -511,6 +532,89 @@ func (s *Store) Days(ch int) []DayInfo {
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Date > out[j].Date })
+	return out
+}
+
+// Ping reports whether the SQLite handle is usable. It is used by /api/ready.
+func (s *Store) Ping() error {
+	if s == nil || s.db == nil {
+		return errors.New("store: not open")
+	}
+	return s.db.Ping()
+}
+
+// SegmentsAll returns every segment matching f without a COUNT or LIMIT. It is
+// used by internal scanners (catalog, retention, queue) that need the whole
+// set; callers should not expose it directly to paginated HTTP clients.
+func (s *Store) SegmentsAll(f SegFilter) []Segment {
+	out := []Segment{}
+	if f.From > 0 && f.To > 0 && f.From > f.To {
+		return out
+	}
+	where, args := segmentWhere(f)
+	query := "SELECT " + segmentColumns + " FROM segments" + where +
+		" ORDER BY start_ts ASC, ch ASC, end_ts ASC"
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		seg, err := scanSegment(rows)
+		if err != nil {
+			break
+		}
+		out = append(out, seg)
+	}
+	return out
+}
+
+// QueueSegments returns the pending/failed/syncing rows for the given channels
+// in one query. collectQueue used to issue one paginated query per channel and
+// status, which grew quadratically with the number of rows.
+func (s *Store) QueueSegments(channels []int, statuses []string) []Segment {
+	out := []Segment{}
+	channels = normalizeChannels(channels)
+	statuses = uniqueStrings(statuses)
+	if len(channels) == 0 || len(statuses) == 0 {
+		return out
+	}
+	chPlaceholders := strings.TrimRight(strings.Repeat("?,", len(channels)), ",")
+	stPlaceholders := strings.TrimRight(strings.Repeat("?,", len(statuses)), ",")
+	query := "SELECT " + segmentColumns + " FROM segments WHERE ch IN (" + chPlaceholders +
+		") AND status IN (" + stPlaceholders + ") ORDER BY start_ts ASC, ch ASC, end_ts ASC"
+	args := make([]any, 0, len(channels)+len(statuses))
+	for _, ch := range channels {
+		args = append(args, ch)
+	}
+	for _, status := range statuses {
+		args = append(args, status)
+	}
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		seg, err := scanSegment(rows)
+		if err != nil {
+			break
+		}
+		out = append(out, seg)
+	}
+	return out
+}
+
+func uniqueStrings(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
 	return out
 }
 

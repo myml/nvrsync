@@ -729,6 +729,22 @@
     }
   }
 
+  function setupLogoutButton() {
+    var btn = document.getElementById('logout-btn');
+    if (!btn) return;
+    btn.hidden = !(state.settings && state.settings.auth_enabled);
+    if (btn.dataset.bound === '1') return;
+    btn.dataset.bound = '1';
+    btn.addEventListener('click', async function () {
+      btn.disabled = true;
+      try {
+        await api('/api/logout', { method: 'POST', quiet: true });
+      } finally {
+        location.replace('/login');
+      }
+    });
+  }
+
   function startStatusPolling() {
     if (pollTimer) return;
     schedulePoll(0);
@@ -2893,6 +2909,7 @@
     }
 
     booted = true;
+    setupLogoutButton();
     route();
     startStatusPolling();
   }

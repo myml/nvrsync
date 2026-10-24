@@ -24,6 +24,13 @@ import (
 // It is overridden at build time via -ldflags "-X main.Version=...".
 var Version = "0.1.1"
 
+// Commit and BuildDate are injected by the Docker/CI build. Together with
+// Version they let /api/health identify the exact image that is running.
+var (
+	Commit    = ""
+	BuildDate = ""
+)
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		log.Printf("fatal: %v", err)
@@ -46,6 +53,13 @@ func applyResetAuth(st *store.Store, reset bool) error {
 	return nil
 }
 
+func valueOrUnknown(v string) string {
+	if v == "" {
+		return "unknown"
+	}
+	return v
+}
+
 func run(args []string) error {
 	cfg, err := config.Parse(args)
 	if err != nil {
@@ -66,7 +80,7 @@ func run(args []string) error {
 
 	sy := syncer.New(st)
 	pl := play.New(st)
-	handler := api.New(st, sy, pl, nil, Version)
+	handler := api.New(st, sy, pl, nil, Version, Commit, BuildDate)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -94,8 +108,8 @@ func run(args []string) error {
 	}()
 
 	set := st.Settings()
-	log.Printf("nvrsync %s listening on %s (data=%s, nvr=%s, channels=%v)",
-		Version, cfg.Listen, cfg.DataDir, set.NVRHost, set.Channels)
+	log.Printf("nvrsync %s (commit=%s build=%s) listening on %s (data=%s, nvr=%s, channels=%v)",
+		Version, valueOrUnknown(Commit), valueOrUnknown(BuildDate), cfg.Listen, cfg.DataDir, set.NVRHost, set.Channels)
 
 	select {
 	case err := <-serverErr:

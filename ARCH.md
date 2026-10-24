@@ -99,7 +99,8 @@ func (p *Player) EnsureProxy(ch int, date string) error           // 可选 ffmp
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/health` | `{ok,version}`（启用登录后仍免登录） |
+| GET | `/api/health` | `{ok,version,commit,build_date}`（启用登录后仍免登录） |
+| GET | `/api/ready` | 就绪检查：SQLite + 存储目录；200/503（免登录） |
 | POST | `/api/login` | `{user,password}` → `{ok:true}` + `nvrsync_session` Cookie；同一 IP 连续失败 5 次锁 60 秒 |
 | POST | `/api/logout` | 删除当前会话并清除 Cookie |
 | POST | `/api/auth/password` | `{user,old_password,new_password}`；未启用时可只设置，启用后必须验证旧密码；成功后重置全部会话 |

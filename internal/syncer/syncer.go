@@ -32,6 +32,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/myml/nvrsync/internal/nvr"
@@ -54,10 +55,12 @@ const (
 	// maxFailedPerRun bounds automatic retries of the permanent-looking
 	// backlog. Pending segments are always processed first.
 	maxFailedPerRun = 200
+	// minFreeBytes keeps the last gigabyte of the volume free for SQLite,
+	// sidecars and the OS; a 1 GB NVR segment can otherwise fill the disk.
+	minFreeBytes = 1 << 30
 	// autoPoll is how often AutoLoop re-reads settings, so changing
 	// AutoMinutes takes effect without restarting the process.
 	autoPoll = 15 * time.Second
-	pageSize = 5000
 	// liveGuard leaves the newest recordings alone for a couple of minutes:
 	// a segment that ends too close to "now" may still be recording, and
 	// downloading it now would persist a truncated file whose tail the
@@ -101,6 +104,9 @@ type Syncer struct {
 	catalogMu   sync.Mutex
 	catalogAt   time.Time
 	catalogLast CatalogResult
+
+	// Stale .part files are removed once per process, not on every run.
+	cleanupOnce sync.Once
 }
 
 // New returns a Syncer backed by st.
@@ -319,6 +325,7 @@ func (p *progress) addDone(bytes int64) {
 func (s *Syncer) run(ctx context.Context, req SyncRequest, done chan struct{}) {
 	started := time.Now()
 	settings := s.st.Settings()
+	s.cleanupOnce.Do(func() { s.cleanupStaleParts(settings.StorageDir) })
 	p := &progress{started: started.Unix()}
 	p.total = 0
 
@@ -358,6 +365,10 @@ func (s *Syncer) run(ctx context.Context, req SyncRequest, done chan struct{}) {
 	s.publish(p, true)
 	if len(queue) == 0 {
 		s.st.Log("info", "scan", "没有需要下载的录像段")
+	} else if free, ok := freeBytes(settings.StorageDir); ok && free < minFreeBytes {
+		err := fmt.Errorf("存储空间不足：仅剩 %s，至少保留 %s", humanBytes(free), humanBytes(minFreeBytes))
+		p.setError(err)
+		s.st.Log("error", "scan", err.Error())
 	} else {
 		s.st.Log("info", "download", fmt.Sprintf("待下载 %d 段，并发 %d", len(queue), downloadWorkers))
 		s.downloadAll(ctx, client, settings, queue, p)
@@ -421,52 +432,49 @@ func (s *Syncer) collectQueue(channels []int, from, to int64) []store.Segment {
 	// otherwise a manual run could still pull a segment that Settings.Cutoff
 	// forbids (and that may still be growing).
 	cutoff := syncCutoff(s.st.Settings(), time.Now().Unix())
-	for _, ch := range channels {
-		for _, status := range []string{"pending", "failed", "syncing"} {
-			for _, seg := range s.listChannel(ch, status) {
-				k := segKey{seg.Ch, seg.Start, seg.End}
-				if seen[k] {
-					continue
-				}
-				seen[k] = true
-				if status == "syncing" {
-					seg.Status = "pending"
-					_ = s.st.UpsertSegment(seg)
-				}
-				if seg.End <= seg.Start {
-					seg.Status = "skipped"
-					seg.Err = "empty time range"
-					_ = s.st.UpsertSegment(seg)
-					continue
-				}
-				if seg.End > cutoff {
-					continue
-				}
-				// A run started with an explicit range only touches segments
-				// that *start* inside it. Overlap matching would make a retry
-				// of a 10s event clip drag in the whole hour-long continuous
-				// recording that contains it.
-				if from > 0 && seg.Start < from {
-					continue
-				}
-				if to > 0 && seg.Start >= to {
-					continue
-				}
-				if isLive(seg, time.Now().Unix()) {
-					// Still recording: keep it pending and retry next round
-					// instead of persisting a truncated file.
-					s.st.LogCh(seg.Ch, "info", "download", fmt.Sprintf("%s 仍在写入，稍后再同步", segTime(seg)))
-					continue
-				}
-				if status == "failed" {
-					if failedCount >= maxFailedPerRun {
-						continue
-					}
-					failedCount++
-				}
-				queue = append(queue, seg)
-			}
+	for _, seg := range s.st.QueueSegments(channels, []string{"pending", "failed", "syncing"}) {
+		status := seg.Status
+		k := segKey{seg.Ch, seg.Start, seg.End}
+		if seen[k] {
+			continue
 		}
+		seen[k] = true
+		if status == "syncing" {
+			seg.Status = "pending"
+			_ = s.st.UpsertSegment(seg)
+		}
+		if seg.End <= seg.Start {
+			seg.Status = "skipped"
+			seg.Err = "empty time range"
+			_ = s.st.UpsertSegment(seg)
+			continue
+		}
+		if seg.End > cutoff {
+			continue
+		}
+		// A run started with an explicit range only touches segments
+		// that *start* inside it. Overlap matching would make a retry
+		// of a 10s event clip drag in the whole hour-long continuous
+		// recording that contains it.
+		if from > 0 && seg.Start < from {
+			continue
+		}
+		if to > 0 && seg.Start >= to {
+			continue
+		}
+		if isLive(seg, time.Now().Unix()) {
+			// Still recording: keep it pending and retry next round
+			// instead of persisting a truncated file.
+			s.st.LogCh(seg.Ch, "info", "download", fmt.Sprintf("%s 仍在写入，稍后再同步", segTime(seg)))
+			continue
+		}
+		if status == "failed" {
+			if failedCount >= maxFailedPerRun {
+				continue
+			}
+			failedCount++
+		}
+		queue = append(queue, seg)
 	}
 	// Drain fresh pending work before retrying the failed backlog.
 	sort.Slice(queue, func(i, j int) bool {
@@ -486,31 +494,11 @@ func (s *Syncer) collectQueue(channels []int, from, to int64) []store.Segment {
 }
 
 func (s *Syncer) listChannel(ch int, status string) []store.Segment {
-	var out []store.Segment
-	offset := 0
-	for {
-		batch, total := s.st.Segments(store.SegFilter{Ch: ch, Status: status, Limit: pageSize, Offset: offset})
-		out = append(out, batch...)
-		offset += len(batch)
-		if len(batch) == 0 || offset >= total {
-			break
-		}
-	}
-	return out
+	return s.st.SegmentsAll(store.SegFilter{Ch: ch, Status: status})
 }
 
 func (s *Syncer) listStatus(status string) []store.Segment {
-	var out []store.Segment
-	offset := 0
-	for {
-		batch, total := s.st.Segments(store.SegFilter{Status: status, Limit: pageSize, Offset: offset})
-		out = append(out, batch...)
-		offset += len(batch)
-		if len(batch) == 0 || offset >= total {
-			break
-		}
-	}
-	return out
+	return s.st.SegmentsAll(store.SegFilter{Status: status})
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +549,22 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 		return
 	}
 	label := fmt.Sprintf("cam%d %s", seg.Ch, segTime(seg))
+	if free, ok := freeBytes(storageDir); ok {
+		need := seg.Size
+		if need <= 0 {
+			need = 256 << 20
+		}
+		if free < need+minFreeBytes {
+			s.st.LogCh(seg.Ch, "error", "download", fmt.Sprintf("%s 磁盘余量不足（剩 %s，需约 %s），保留为 pending",
+				label, humanBytes(free), humanBytes(need)))
+			_ = s.st.UpsertSegment(store.Segment{
+				Ch: seg.Ch, Start: seg.Start, End: seg.End,
+				Status: "pending", Err: "disk full",
+			})
+			return
+		}
+	}
+
 	p.setCur(label)
 	s.publish(p, true)
 	s.st.LogCh(seg.Ch, "info", "download", fmt.Sprintf("%s 开始（NVR %s，本地 %s）", label, humanBytes(seg.Size), rel))
@@ -837,6 +841,47 @@ func (s *Syncer) cleanupRetention(settings store.Settings) {
 		s.st.Log("info", "scan", fmt.Sprintf("保留清理：删除 %d 个过期文件（%d 天）", removed, settings.RetentionD))
 	} else {
 		s.st.Log("info", "scan", fmt.Sprintf("保留清理：无过期文件（%d 天）", settings.RetentionD))
+	}
+}
+
+// freeBytes reports the space available to an unprivileged writer.
+func freeBytes(dir string) (int64, bool) {
+	if strings.TrimSpace(dir) == "" {
+		return 0, false
+	}
+	var fs syscall.Statfs_t
+	if err := syscall.Statfs(dir, &fs); err != nil {
+		return 0, false
+	}
+	return int64(fs.Bavail) * int64(fs.Bsize), true
+}
+
+// cleanupStaleParts removes interrupted downloads left behind by a crash or a
+// container restart. Only files older than an hour are touched, so an active
+// download from a concurrent process is never removed.
+func (s *Syncer) cleanupStaleParts(storageDir string) {
+	root := filepath.Join(strings.TrimSpace(storageDir), "rec")
+	if strings.TrimSpace(storageDir) == "" {
+		return
+	}
+	removed := 0
+	_ = filepath.Walk(root, func(name string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(name, ".part") && !strings.HasSuffix(name, ".json.tmp") {
+			return nil
+		}
+		if time.Since(info.ModTime()) < time.Hour {
+			return nil
+		}
+		if err := os.Remove(name); err == nil {
+			removed++
+		}
+		return nil
+	})
+	if removed > 0 {
+		s.st.Log("info", "scan", fmt.Sprintf("清理了 %d 个残留的未完成下载文件", removed))
 	}
 }
 

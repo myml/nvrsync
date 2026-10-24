@@ -382,7 +382,7 @@ func isPublicRequest(r *http.Request) bool {
 		return true
 	case r.URL.Path == "/api/login" && r.Method == http.MethodPost:
 		return true
-	case r.URL.Path == "/api/health" && r.Method == http.MethodGet:
+	case (r.URL.Path == "/api/health" || r.URL.Path == "/api/ready") && r.Method == http.MethodGet:
 		return true
 	}
 	return false
