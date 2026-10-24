@@ -31,6 +31,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/myml/nvrsync/internal/nvr"
@@ -47,6 +48,12 @@ const (
 	// busyRetryBase is used for the NVR's -40401 ("no session budget") reply.
 	// It is transient; hammering the device with 2s retries makes it worse.
 	busyRetryBase = 10 * time.Second
+	// maxBusyStreak stops one run after this many consecutive busy failures,
+	// so a saturated NVR does not turn the whole queue into retries.
+	maxBusyStreak = 8
+	// maxFailedPerRun bounds automatic retries of the permanent-looking
+	// backlog. Pending segments are always processed first.
+	maxFailedPerRun = 200
 	// autoPoll is how often AutoLoop re-reads settings, so changing
 	// AutoMinutes takes effect without restarting the process.
 	autoPoll = 15 * time.Second
@@ -361,6 +368,17 @@ func (s *Syncer) run(ctx context.Context, req SyncRequest, done chan struct{}) {
 	}
 }
 
+func statusRank(status string) int {
+	switch status {
+	case "pending", "syncing":
+		return 0
+	case "failed":
+		return 1
+	default:
+		return 2
+	}
+}
+
 func channelList(chs []int) string {
 	var b strings.Builder
 	b.WriteByte('[')
@@ -398,6 +416,7 @@ type segKey struct {
 func (s *Syncer) collectQueue(channels []int, from, to int64) []store.Segment {
 	seen := map[segKey]bool{}
 	var queue []store.Segment
+	failedCount := 0
 	// Segments left pending from earlier runs must respect the cutoff too,
 	// otherwise a manual run could still pull a segment that Settings.Cutoff
 	// forbids (and that may still be growing).
@@ -439,11 +458,22 @@ func (s *Syncer) collectQueue(channels []int, from, to int64) []store.Segment {
 					s.st.LogCh(seg.Ch, "info", "download", fmt.Sprintf("%s 仍在写入，稍后再同步", segTime(seg)))
 					continue
 				}
+				if status == "failed" {
+					if failedCount >= maxFailedPerRun {
+						continue
+					}
+					failedCount++
+				}
 				queue = append(queue, seg)
 			}
 		}
 	}
+	// Drain fresh pending work before retrying the failed backlog.
 	sort.Slice(queue, func(i, j int) bool {
+		ri, rj := statusRank(queue[i].Status), statusRank(queue[j].Status)
+		if ri != rj {
+			return ri < rj
+		}
 		if queue[i].Start != queue[j].Start {
 			return queue[i].Start < queue[j].Start
 		}
@@ -490,12 +520,21 @@ func (s *Syncer) listStatus(status string) []store.Segment {
 func (s *Syncer) downloadAll(ctx context.Context, client *nvr.Client, settings store.Settings, queue []store.Segment, p *progress) {
 	jobs := make(chan store.Segment)
 	var wg sync.WaitGroup
+	var busyStreak atomic.Int32
+	trip := make(chan struct{})
+	var tripOnce sync.Once
+	tripFn := func() {
+		tripOnce.Do(func() {
+			close(trip)
+			s.st.Log("warn", "download", "NVR 连续繁忙，本轮提前收尾，剩余段保留到下一轮")
+		})
+	}
 	for i := 0; i < downloadWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for seg := range jobs {
-				s.downloadOne(ctx, client, settings.StorageDir, seg, p)
+				s.downloadOne(ctx, client, settings.StorageDir, seg, p, &busyStreak, tripFn)
 			}
 		}()
 	}
@@ -504,6 +543,8 @@ feed:
 		select {
 		case <-ctx.Done():
 			break feed
+		case <-trip:
+			break feed
 		case jobs <- seg:
 		}
 	}
@@ -511,7 +552,7 @@ feed:
 	wg.Wait()
 }
 
-func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir string, seg store.Segment, p *progress) {
+func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir string, seg store.Segment, p *progress, busyStreak *atomic.Int32, trip func()) {
 	rel, abs, err := segmentPaths(storageDir, seg)
 	if err != nil {
 		s.markFailed(seg, err)
@@ -546,6 +587,7 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 		start := time.Now()
 		stats, err := s.attemptDownload(ctx, client, storageDir, seg, rel, abs)
 		if err == nil {
+			busyStreak.Store(0)
 			took := time.Since(start)
 			p.addDone(stats.Bytes)
 			p.setCur("")
@@ -587,10 +629,14 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 			Status: "pending", Err: lastErr.Error(),
 		})
 		s.st.LogCh(seg.Ch, "warn", "download", label+" NVR 繁忙（-40401），保留为 pending")
+		if busyStreak.Add(1) >= maxBusyStreak {
+			trip()
+		}
 		p.setCur("")
 		s.publish(p, true)
 		return
 	}
+	busyStreak.Store(0)
 	if errors.Is(lastErr, nvr.ErrNoMedia) {
 		_ = s.st.UpsertSegment(store.Segment{
 			Ch: seg.Ch, Start: seg.Start, End: seg.End,
