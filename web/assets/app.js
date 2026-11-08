@@ -789,6 +789,106 @@
     card.sub.textContent = message || '加载中…';
   }
 
+  /* ---- 列表上方概览：分段比例条 + 可点击图例 ---------------------------- */
+
+  // 概览里展示的状态顺序（与统计卡的语义色一致）。
+  var OVERVIEW_STATUSES = ['done', 'pending', 'syncing', 'failed', 'skipped', 'local_only'];
+
+  /**
+   * 渲染概览：总量、分段比例条、每个状态的图例（数量 + 百分比 + 迷你柱）。
+   * 点击任意色段或图例项都会调用 onPick(status)，由调用方切换列表筛选。
+   * stats 为 /api/stats 的返回（total/done/pending/syncing/failed/skipped/local_only）。
+   */
+  function overviewPanel(stats, activeStatus, onPick) {
+    var total = Number(stats && stats.total) || 0;
+    var count = function (key) {
+      return Number(stats && stats[key]) || 0;
+    };
+    var denom = total || 1;
+    var done = count('done');
+    var waiting = count('pending') + count('syncing');
+
+    var bar = el('div', { class: 'ov-bar', role: 'group', 'aria-label': '状态占比' });
+    OVERVIEW_STATUSES.forEach(function (key) {
+      var n = count(key);
+      if (n <= 0) return;
+      var meta = STATUS_META[key];
+      var pct = (n / denom) * 100;
+      var seg = el('button', {
+        class: 'ov-seg badge-tone-' + meta.cls,
+        type: 'button',
+        style: 'flex: ' + n + ' 1 0',
+        title: meta.label + ' ' + num(n) + ' 段 · ' + pct.toFixed(1) + '%',
+        'aria-label': meta.label + ' ' + num(n) + ' 段，点击筛选'
+      });
+      seg.addEventListener('click', function () { onPick(key); });
+      bar.appendChild(seg);
+    });
+
+    var legend = el('div', { class: 'ov-legend' });
+    OVERVIEW_STATUSES.forEach(function (key) {
+      var meta = STATUS_META[key];
+      var n = count(key);
+      var pct = total > 0 ? (n / denom) * 100 : 0;
+      var empty = n === 0;
+      var item = el('button', {
+        class: 'ov-item badge-tone-' + meta.cls +
+          (empty ? ' is-empty' : '') +
+          (activeStatus === key ? ' is-active' : ''),
+        type: 'button',
+        disabled: empty,
+        title: empty ? meta.label + '：0 段' : '只看「' + meta.label + '」'
+      }, [
+        el('div', { class: 'ov-item-head' }, [
+          el('span', { class: 'ov-dot' }),
+          el('span', { text: meta.label })
+        ]),
+        el('div', { class: 'ov-item-val' }, [
+          el('b', { text: num(n) }),
+          el('span', { text: pct.toFixed(1) + '%' })
+        ]),
+        el('div', { class: 'ov-mini' }, [
+          el('i', { style: 'width: ' + Math.max(0, Math.min(100, pct)) + '%' })
+        ])
+      ]);
+      if (!empty) item.addEventListener('click', function () { onPick(key); });
+      legend.appendChild(item);
+    });
+
+    return el('section', { class: 'card ov' }, [
+      el('div', { class: 'ov-top' }, [
+        el('div', {}, [
+          el('div', { class: 'ov-total-label', text: '当前筛选范围内共' }),
+          el('div', { class: 'ov-total' }, [
+            el('b', { text: num(total) }),
+            el('small', { text: ' 段 · ' + (total > 0 ? ((done / denom) * 100).toFixed(1) : '0') + '% 已完成' })
+          ])
+        ]),
+        el('div', { class: 'ov-right' }, [
+          el('span', { class: 'ov-pill badge-tone-bad' + (count('failed') === 0 ? ' is-empty' : '') }, [
+            el('span', { text: '失败 ' + num(count('failed')) })
+          ]),
+          el('span', { class: 'ov-pill badge-tone-wait' + (waiting === 0 ? ' is-empty' : '') }, [
+            el('span', { text: '待同步 ' + num(waiting) })
+          ]),
+          el('span', { class: 'ov-pill badge-tone-ok' }, [
+            el('span', { text: '已同步 ' + num(done) })
+          ])
+        ])
+      ]),
+      bar,
+      legend
+    ]);
+  }
+
+  function overviewLoading() {
+    return el('section', { class: 'card ov is-loading' }, [
+      el('div', { class: 'ov-skeleton-line' }),
+      el('div', { class: 'ov-skeleton-bar' }),
+      el('div', { class: 'ov-skeleton-legend' })
+    ]);
+  }
+
   var syncView = {
     mount: function (root) {
       var view = {
@@ -796,6 +896,8 @@
         logTimer: null,
         segSeq: 0,
         statsSeq: 0,
+        ovSeq: 0,
+        stats: null,
         logsSeq: 0,
         starting: false,
         hooks: null
@@ -825,6 +927,9 @@
         return card.node;
       });
       var stats = el('div', { class: 'stats' }, cards);
+
+      /* ---- 概览（列表上方：总量 + 比例条 + 可点击图例） ---- */
+      var overview = el('div', { class: 'ov-slot' }, [overviewLoading()]);
 
       /* ---- 工具栏 ---- */
       var chSelect = el('select', { class: 'control', id: 'sync-ch' },
@@ -910,12 +1015,14 @@
         pageHeader('同步', '从 NVR 拉取缺失的录像段；进度与历史日志会自动刷新。'),
         progress,
         stats,
+        overview,
         toolbar,
         tableCard,
         logsCard
       ]);
       root.appendChild(page);
 
+      view.overview = overview;
       view.progress = progress;
       view.progressLabel = progressLabel;
       view.progressFill = progressFill;
@@ -939,22 +1046,24 @@
         loadStats(view);
       });
 
+      // 日期范围同时决定列表和概览的统计口径（/api/stats 也接受 from/to）。
       fromInput.addEventListener('change', function () {
         f.from = fromInput.value;
         f.page = 1;
         loadSegments(view);
+        loadStats(view);
       });
 
       toInput.addEventListener('change', function () {
         f.to = toInput.value;
         f.page = 1;
         loadSegments(view);
+        loadStats(view);
       });
 
+      // 下拉与概览图例共用 setStatusFilter，保证两处筛选状态一致。
       statusSelect.addEventListener('change', function () {
-        f.status = statusSelect.value;
-        f.page = 1;
-        loadSegments(view);
+        setStatusFilter(view, statusSelect.value, { fromSelect: true });
       });
 
       refreshBtn.addEventListener('click', function () {
@@ -1022,6 +1131,26 @@
     }
   };
 
+  /**
+   * 切换状态筛选：更新下拉框、概览高亮与列表，并回到第 1 页。
+   * 统计卡和概览的总量只随通道/日期变化，所以这里不重新拉统计。
+   */
+  function setStatusFilter(view, status, opts) {
+    var f = state.filters;
+    status = status || '';
+    if (f.status === status) return;
+    f.status = status;
+    f.page = 1;
+
+    var select = document.getElementById('sync-status');
+    if (select && !(opts && opts.fromSelect)) select.value = status;
+
+    // 概览高亮立即切换，不必等待列表请求返回。
+    if (view.stats) renderOverview(view, view.stats);
+
+    loadSegments(view);
+  }
+
   /** 后台对账：把 NVR 当前持有的录像同步进本地索引（只列不下载）。 */
   async function refreshCatalog(view, opts) {
     var force = !!(opts && opts.force);
@@ -1053,28 +1182,56 @@
     });
   }
 
+  /** 当前筛选（通道 + 日期）对应的统计请求参数；状态筛选不参与统计。 */
+  function statsQuery() {
+    var f = state.filters;
+    var from = f.from ? dayBounds(f.from) : null;
+    var to = f.to ? dayBounds(f.to) : null;
+    return {
+      ch: f.ch > 0 ? f.ch : 0,
+      from: from ? from.from : '',
+      to: to ? to.to : ''
+    };
+  }
+
+  function renderOverview(view, d) {
+    clear(view.overview);
+    view.overview.appendChild(overviewPanel(d, state.filters.status, function (status) {
+      setStatusFilter(view, status);
+    }));
+  }
+
   async function loadStats(view) {
     var seq = ++view.statsSeq;
     var f = state.filters;
-    var ch = f.ch > 0 ? f.ch : 0;
 
     resetStats(view);
 
-    var res = await api('/api/stats?' + queryString({ ch: ch }), { quiet: true });
+    var res = await api('/api/stats?' + queryString(statsQuery()), { quiet: true });
     if (view.destroyed || seq !== view.statsSeq) return;
     if (!res.ok || !res.data) {
       Object.keys(view.statCards).forEach(function (key) {
         statLoading(view.statCards[key], '加载失败');
       });
+      // 概览保留上一次成功的数据，避免失败时整块被清空。
+      if (!view.stats) {
+        clear(view.overview);
+        view.overview.appendChild(el('section', { class: 'card ov is-error' }, [
+          el('div', { class: 'ov-total-label', text: '概览加载失败：' + (res.error || '未知错误') })
+        ]));
+      }
       toast('统计信息加载失败：' + (res.error || '未知错误'), 'error');
       return;
     }
 
     var d = res.data;
+    view.stats = d;
+    renderOverview(view, d);
     var chLabel = f.ch > 0 ? 'CAM ' + f.ch : '全部通道';
     var donePct = d.total > 0 ? Math.round((d.done / d.total) * 100) + '%' : '0%';
 
-    setStat(view.statCards.all, num(d.total), chLabel + ' · 全部状态');
+    var rangeLabel = f.from && f.to ? ' · ' + f.from + ' ~ ' + f.to : '';
+    setStat(view.statCards.all, num(d.total), chLabel + rangeLabel);
     setStat(view.statCards.done, num(d.done), donePct + ' 已完成');
     setStat(
       view.statCards.pending,
@@ -1187,6 +1344,7 @@
           el('th', { text: '时间段' }),
           el('th', { class: 'num', text: '大小' }),
           el('th', { text: '状态' }),
+          el('th', { text: '错误' }),
           el('th', { text: '同步时间' }),
           el('th', { class: 'actions', text: '操作' })
         ])
@@ -1243,11 +1401,24 @@
         actionCell.appendChild(el('span', { class: 'muted small', text: '—' }));
       }
 
-      tbody.appendChild(el('tr', {}, [
+      // 失败/待同步行的左缘着色，让问题行在长列表里一眼可见。
+      var rowClass = seg.status === 'failed' ? 'row-failed'
+        : seg.status === 'pending' ? 'row-pending' : '';
+
+      var errText = String(seg.err || '').trim();
+      var errCell = el('td', { class: 'err-cell' });
+      if (errText) {
+        errCell.appendChild(el('span', { class: 'err-text', text: errText, title: errText }));
+      } else {
+        errCell.appendChild(el('span', { class: 'muted small', text: '—' }));
+      }
+
+      tbody.appendChild(el('tr', { class: rowClass }, [
         el('td', {}, [el('span', { class: 'ch-badge', text: 'CAM ' + seg.ch })]),
         timeCell,
         sizeCell,
         el('td', {}, [statusBadge(seg)]),
+        errCell,
         syncedCell,
         actionCell
       ]));
@@ -1269,11 +1440,44 @@
       if (f.page < pages) { f.page++; loadSegments(view); }
     });
 
+    var pagerInfo = el('span', { class: 'pager-info' });
+    pagerInfo.appendChild(document.createTextNode(
+      '第 ' + first + '–' + last + ' 条，共 ' + num(total) + ' 条'
+    ));
+    // 附上当前范围内的失败 / 待同步数量：翻页时也能看到问题规模，
+    // 已按状态筛选时则换成可一键清除筛选的标签。
+    var stats = view.stats;
+    var tag = function (status, label, tone, n, title) {
+      var chip = el('button', {
+        class: 'pager-tag badge-tone-' + tone,
+        type: 'button',
+        title: title,
+        text: label + ' ' + num(n)
+      });
+      chip.addEventListener('click', function () {
+        setStatusFilter(view, f.status === status ? '' : status);
+      });
+      pagerInfo.appendChild(chip);
+    };
+    if (stats) {
+      var failedN = Number(stats.failed) || 0;
+      var waitN = (Number(stats.pending) || 0) + (Number(stats.syncing) || 0);
+      if (!f.status && failedN) {
+        pagerInfo.appendChild(document.createTextNode(' · '));
+        tag('failed', '失败', 'bad', failedN, '只看失败');
+      }
+      if (!f.status && waitN) {
+        pagerInfo.appendChild(document.createTextNode(' · '));
+        tag('pending', '待同步', 'wait', waitN, '只看待同步');
+      }
+      if (f.status && (f.status === 'failed' || f.status === 'pending' || f.status === 'syncing')) {
+        pagerInfo.appendChild(document.createTextNode(' · 已筛选，'));
+        tag(f.status, '清除筛选', STATUS_META[f.status].cls, total, '显示全部状态');
+      }
+    }
+
     var pager = el('div', { class: 'pager' }, [
-      el('span', {
-        class: 'pager-info',
-        text: '第 ' + first + '–' + last + ' 条，共 ' + num(total) + ' 条'
-      }),
+      pagerInfo,
       el('div', { class: 'pager-actions' }, [
         prev,
         el('span', { class: 'page-num', text: f.page + ' / ' + pages }),
@@ -1474,7 +1678,7 @@
       var gridHost = el('div');
 
       var page = el('div', { class: 'page' }, [
-        pageHeader('录像', '已同步完成的录像按天归档；点击卡片即可在线回看。', [
+        pageHeader('录像', '按天查看同步进度：绿色为已同步完成，黄色为正在同步；点击卡片即可在线回看。', [
           el('div', { class: 'field compact' }, [
             el('label', { for: 'rec-ch', text: '通道' }),
             chSelect
@@ -1533,8 +1737,8 @@
         clear(gridHost);
         if (!days.length) {
           gridHost.appendChild(statePanel({
-            title: '还没有已同步的录像',
-            hint: '在同步页启动一次同步后，已完成的录像会按天汇总到这里。',
+            title: '还没有这一通道的录像',
+            hint: '在同步页启动一次同步（或在同步页刷新 NVR 录像列表）后，各天的同步情况会汇总到这里。',
             actions: [el('a', {
               class: 'btn btn-primary',
               href: '#/sync'
@@ -1545,6 +1749,7 @@
 
         var grid = el('div', { class: 'day-grid' });
         days.forEach(function (day) { grid.appendChild(dayCard(day, ch)); });
+        gridHost.appendChild(daySummary(days));
         gridHost.appendChild(grid);
       }
 
@@ -2180,19 +2385,116 @@
     ]);
   }
 
+  /* ---- 天状态 -------------------------------------------------------------
+     颜色只表达"这一天同步到哪了"：
+       ok   绿：这一天的段全部落到本地（done / local_only）
+       warn 黄：这一天有段正在下载，或还在排队
+       idle 灰：还没有任何本地可播放的段，或只剩失败 / 跳过的段
+     段数一律显示"已完成/总数"，总数取 NVR 上该天的全部段。            */
+
+  var DAY_TONE_ICON = { ok: 'check', warn: 'clock', idle: 'minus' };
+
+  /** 把 /api/days 的一行规整成天卡片需要的数字，兼容缺少新字段的旧响应。 */
+  function dayStats(day) {
+    var local = toInt(day.local, 0);
+    var syncing = toInt(day.syncing, 0);
+    var pending = toInt(day.pending, 0);
+    var failed = toInt(day.failed, 0);
+    var skipped = toInt(day.skipped, 0);
+    var known = local > 0 || syncing > 0 || pending > 0 || failed > 0 || skipped > 0;
+    var total = toInt(day.total, 0);
+    var segments = toInt(day.segments, 0);
+    if (total <= 0) total = known ? local + syncing + pending + failed + skipped : segments;
+    var done = known ? local : segments;
+    return {
+      done: done,
+      total: Math.max(total, done),
+      syncing: syncing,
+      pending: pending,
+      failed: failed,
+      skipped: skipped,
+      pct: total > 0 ? clamp(Math.round((done / total) * 100), 0, 100) : 100
+    };
+  }
+
+  function dayTone(stats) {
+    if (stats.done >= stats.total) return 'ok';
+    if (stats.syncing > 0 || stats.pending > 0) return 'warn';
+    return 'idle';
+  }
+
+  var DAY_TONE_LABEL = { ok: '已同步', warn: '同步中', idle: '未同步' };
+
+  function dayStateNode(tone) {
+    return el('span', { class: 'day-state' }, [
+      icon(DAY_TONE_ICON[tone]),
+      document.createTextNode(DAY_TONE_LABEL[tone])
+    ]);
+  }
+
+  /** 失败 / 跳过 的存活提示，避免坏段被一片绿色掩盖。 */
+  function dayFlags(stats) {
+    var parts = [];
+    if (stats.failed > 0) {
+      parts.push(el('span', { class: 'day-flag' }, [
+        icon('alert'), document.createTextNode(stats.failed + ' 失败')
+      ]));
+    }
+    if (stats.skipped > 0) {
+      parts.push(el('span', { class: 'day-flag muted' }, [
+        icon('minus'), document.createTextNode(stats.skipped + ' 跳过')
+      ]));
+    }
+    return parts.length ? el('span', { class: 'day-flags' }, parts) : null;
+  }
+
+  /** 当天还在写入：已同步的天加上一个小角标。 */
+  function isToday(date) {
+    return date === isoDate(new Date());
+  }
+
   function dayCard(day, ch) {
     var date = String(day.date || '');
-    var card = el('button', { class: 'day-card', type: 'button' }, [
+    var stats = dayStats(day);
+    var tone = dayTone(stats);
+    var live = tone === 'ok' && isToday(date);
+
+    var card = el('button', {
+      class: 'day-card tone-' + tone,
+      type: 'button',
+      title: '打开 ' + date + ' 的回放'
+    }, [
       el('div', { class: 'day-top' }, [
         el('span', { class: 'day-date', text: date }),
-        el('span', { class: 'tag accent', text: weekdayName(date) })
+        dayStateNode(tone)
       ]),
-      el('div', { class: 'day-weekday', text: 'CAM ' + ch }),
+      el('div', { class: 'day-weekday' }, [
+        document.createTextNode(weekdayName(date) + ' · CAM ' + ch),
+        live ? el('span', { class: 'day-live', text: '今天' }) : null
+      ]),
+      el('div', { class: 'day-progress' }, [
+        el('span', { class: 'day-count' }, [
+          el('span', { class: 'done-part', text: num(stats.done) }),
+          el('span', { class: 'slash', text: '/' }),
+          el('span', { class: 'total-part', text: num(stats.total) })
+        ]),
+        el('span', { class: 'day-count-label', text: '段 · ' + stats.pct + '%' }),
+        dayFlags(stats)
+      ]),
+      el('div', {
+        class: 'day-bar',
+        role: 'progressbar',
+        'aria-valuemin': '0',
+        'aria-valuemax': '100',
+        'aria-valuenow': String(stats.pct),
+        'aria-label': '已同步 ' + stats.done + ' / ' + stats.total + ' 段'
+      }, [el('i', { style: { width: stats.pct + '%' } })]),
+      // 本地已同步部分的统计：时长、大小、码率沿用原卡片的字段与口径。
       el('div', { class: 'day-meta' }, [
-        metaCell('段数', num(day.segments)),
         metaCell('时长', formatDuration(day.seconds)),
         metaCell('大小', formatBytes(day.bytes)),
-        metaCell('码率', formatBitrate(day.bytes, day.seconds))
+        metaCell('码率', formatBitrate(day.bytes, day.seconds)),
+        metaCell('本地段数', num(day.segments))
       ]),
       el('span', { class: 'day-arrow' }, [icon('arrowRight')])
     ]);
@@ -2201,6 +2503,29 @@
       location.hash = '#/recordings/' + ch + '/' + date;
     });
     return card;
+  }
+
+  /** 卡片墙上方的汇总：三种颜色的天数。 */
+  function daySummary(days) {
+    var counts = { ok: 0, warn: 0, idle: 0 };
+    days.forEach(function (day) { counts[dayTone(dayStats(day))]++; });
+    return el('div', { class: 'rec-summary' }, [
+      el('span', { class: 'sum-pill tone-ok' }, [
+        el('span', { class: 'sum-dot' }), document.createTextNode('已同步 '),
+        el('b', { text: num(counts.ok) })
+      ]),
+      el('span', { class: 'sum-pill tone-warn' }, [
+        el('span', { class: 'sum-dot' }), document.createTextNode('同步中 '),
+        el('b', { text: num(counts.warn) })
+      ]),
+      el('span', { class: 'sum-pill tone-idle' }, [
+        el('span', { class: 'sum-dot' }), document.createTextNode('未同步 '),
+        el('b', { text: num(counts.idle) })
+      ]),
+      el('span', { class: 'legend' }, [
+        icon('info'), document.createTextNode('段数 = 已完成 / NVR 上的总段数')
+      ])
+    ]);
   }
 
   /* ========================================================================

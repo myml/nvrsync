@@ -335,9 +335,24 @@ func (s *server) handleNVRTest(w http.ResponseWriter, r *http.Request) {
 
 // handleStats serves the sync page dashboard in one request.
 func (s *server) handleStats(w http.ResponseWriter, r *http.Request) {
-	ch, err := parseIntParam(r.URL.Query().Get("ch"), 0)
+	q := r.URL.Query()
+	ch, err := parseIntParam(q.Get("ch"), 0)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid ch: "+err.Error())
+		return
+	}
+	from, err := parseTimeParam(q.Get("from"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid from: "+err.Error())
+		return
+	}
+	to, err := parseTimeParam(q.Get("to"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid to: "+err.Error())
+		return
+	}
+	if from != 0 && to != 0 && from > to {
+		writeError(w, http.StatusBadRequest, "from must not be after to")
 		return
 	}
 	state := s.st.SyncState()
@@ -347,7 +362,7 @@ func (s *server) handleStats(w http.ResponseWriter, r *http.Request) {
 		Running   bool    `json:"running"`
 		StartedAt int64   `json:"started_at"`
 	}{
-		Stats:     s.st.Stats(ch),
+		Stats:     s.st.Stats(store.SegFilter{Ch: ch, From: from, To: to}),
 		Speed:     state.Speed,
 		Running:   state.Running,
 		StartedAt: state.StartedAt,

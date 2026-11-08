@@ -21,19 +21,25 @@ type Stats struct {
 	StorageTotal int64 `json:"storage_total"`
 }
 
-// Stats returns the dashboard aggregate, optionally limited to one channel.
+// Stats returns the dashboard aggregate for the segments matching f, using the
+// same channel/time semantics as Segments: From/To form a half-open interval
+// and a segment counts when it overlaps it. Other filter fields are ignored so
+// the dashboard can stay independent of the status filter.
 // It intentionally uses one conditional-aggregation query: the previous
 // implementation issued five separate full scans (one per status group plus
 // MIN/MAX/SUM/COUNT(DISTINCT)).
-func (s *Store) Stats(ch int) Stats {
+func (s *Store) Stats(f SegFilter) Stats {
 	var st Stats
 
-	where := ""
-	args := []any{}
-	if ch > 0 {
-		where = " WHERE ch = ?"
-		args = append(args, ch)
+	// An explicitly inverted range matches nothing; Segments reports zero for
+	// it, so the dashboard must agree rather than silently aggregate it all.
+	if f.From > 0 && f.To > 0 && f.From > f.To {
+		return s.withStorage(st)
 	}
+
+	f.Status, f.Limit, f.Offset = "", 0, 0
+	where, args := segmentWhere(f)
+
 	_ = s.db.QueryRow(`SELECT
 			COUNT(*),
 			COALESCE(SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END), 0),
@@ -54,6 +60,11 @@ func (s *Store) Stats(ch int) Stats {
 		&st.LocalOnly, &st.Skipped, &st.Earliest, &st.Latest, &st.Bytes, &st.Days,
 	)
 
+	return s.withStorage(st)
+}
+
+// withStorage fills the free/total figures of the configured storage dir.
+func (s *Store) withStorage(st Stats) Stats {
 	if dir := s.Settings().StorageDir; dir != "" {
 		var fs syscall.Statfs_t
 		if err := syscall.Statfs(dir, &fs); err == nil {

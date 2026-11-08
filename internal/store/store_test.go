@@ -897,15 +897,31 @@ func TestStatsSingleQuery(t *testing.T) {
 	} {
 		mustUpsert(t, s, seg)
 	}
-	got := s.Stats(0)
+	got := s.Stats(SegFilter{})
 	if got.Total != 5 || got.Done != 1 || got.LocalOnly != 1 || got.Pending != 1 || got.Failed != 1 || got.Skipped != 1 {
 		t.Errorf("Stats() counts = %+v", got)
 	}
 	if got.Bytes != 150 || got.Earliest != base || got.Latest != base+20 || got.Days != 1 {
 		t.Errorf("Stats() aggregate = %+v", got)
 	}
-	if only := s.Stats(2); only.Total != 1 || only.Done != 0 || only.LocalOnly != 1 || only.Bytes != 50 {
+	if only := s.Stats(SegFilter{Ch: 2}); only.Total != 1 || only.Done != 0 || only.LocalOnly != 1 || only.Bytes != 50 {
 		t.Errorf("Stats(2) = %+v", only)
+	}
+	// From/To use the same overlap semantics as Segments: a segment counts
+	// when it overlaps [From, To). [base, base+25) covers the ch1 done
+	// segment (0..10) and the ch2 local_only one (0..20); the pending segment
+	// starts at base+30, after To, so it is excluded.
+	if ranged := s.Stats(SegFilter{From: base, To: base + 25}); ranged.Total != 2 || ranged.Done != 1 || ranged.LocalOnly != 1 || ranged.Pending != 0 {
+		t.Errorf("Stats(range) = %+v", ranged)
+	}
+	// Status is ignored so the dashboard stays independent of the table's
+	// status filter.
+	if noStatus := s.Stats(SegFilter{Status: "failed"}); noStatus.Total != 5 {
+		t.Errorf("Stats(status) = %+v", noStatus)
+	}
+	// An inverted range matches nothing, agreeing with Segments().
+	if inv := s.Stats(SegFilter{From: base + 100, To: base}); inv.Total != 0 || inv.Done != 0 {
+		t.Errorf("Stats(inverted) = %+v", inv)
 	}
 }
 

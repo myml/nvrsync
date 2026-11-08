@@ -109,6 +109,7 @@ func (p *Player) EnsureProxy(ch int, date string) error           // 可选 ffmp
 | POST | `/api/catalog/refresh` | 后台对账：把 NVR 仍在的录像合并进索引，NVR 已覆盖的标为 `local_only`，从没下过的标 `skipped` |
 | POST | `/api/nvr/scan` | `{channels,from,to}` 只列出 NVR 录像写入本地索引（不下载），超过截止时间的段标为 skipped |
 | GET | `/api/segments?ch=&from=&to=&status=&limit=&offset=` | 列表 + total |
+| GET | `/api/stats?ch=&from=&to=` | 概览统计：各状态段数 + 最早/最新/占用/天数/存储；`from`/`to` 与 segments 同语义（区间重叠即计入），不含 status 维度，供列表上方概览与统计卡使用 |
 | POST | `/api/sync/start` | `{channels,from,to,force}`（from/to 可省略=自动） |
 | POST | `/api/sync/stop` | |
 | GET | `/api/sync/status` | `{running,cur,total,bytes,speed,started_at}` |

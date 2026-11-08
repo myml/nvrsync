@@ -744,6 +744,391 @@ input[type="date"]::-webkit-calendar-picker-indicator {
 }
 
 /* --------------------------------------------------------------------------
+   同步页 — 列表上方概览（分段比例条 + 可点击图例）
+   -------------------------------------------------------------------------- */
+
+.ov-slot {
+  margin-bottom: 16px;
+}
+
+.ov {
+  position: relative;
+  padding: 16px 18px 14px;
+  overflow: hidden;
+}
+
+.ov::after {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.08), transparent);
+}
+
+.ov-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.ov-total-label {
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 550;
+}
+
+.ov-total {
+  display: flex;
+  align-items: baseline;
+  gap: 2px;
+  margin-top: 2px;
+}
+
+.ov-total b {
+  font-size: 30px;
+  line-height: 1.05;
+  font-weight: 680;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+}
+
+.ov-total small {
+  font-size: 12.5px;
+  color: var(--faint);
+}
+
+.ov-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ov-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 28px;
+  padding: 0 11px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.ov-pill::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--tone);
+  flex: 0 0 auto;
+}
+
+.ov-pill.is-empty {
+  opacity: 0.45;
+}
+
+/* 概览分段条 */
+.ov-bar {
+  display: flex;
+  gap: 2px;
+  height: 22px;
+  margin-top: 14px;
+  border-radius: 7px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.ov-seg {
+  position: relative;
+  min-width: 4px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: var(--tone);
+  opacity: 0.92;
+  cursor: pointer;
+  transition: filter 0.14s, opacity 0.14s, transform 0.12s;
+}
+
+.ov-seg:first-child {
+  border-radius: 7px 0 0 7px;
+}
+
+.ov-seg:last-child {
+  border-radius: 0 7px 7px 0;
+}
+
+.ov-seg:only-child {
+  border-radius: 7px;
+}
+
+.ov-seg::after {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 1px;
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.ov-seg:first-child::after {
+  display: none;
+}
+
+.ov-seg:hover {
+  filter: brightness(1.3);
+  transform: scaleY(1.12);
+}
+
+.ov-seg:focus-visible {
+  outline: 2px solid #fff;
+  outline-offset: -2px;
+}
+
+/* 图例 */
+.ov-legend {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 9px;
+  margin-top: 13px;
+}
+
+.ov-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 9px 11px;
+  border: 1px solid var(--border-soft);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.018);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.14s, border-color 0.14s, transform 0.08s;
+}
+
+.ov-item:hover {
+  background: rgba(255, 255, 255, 0.045);
+  border-color: #323a48;
+}
+
+.ov-item:active {
+  transform: translateY(1px);
+}
+
+.ov-item:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.ov-item.is-active {
+  border-color: var(--tone);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+@supports (background: color-mix(in srgb, red 10%, transparent)) {
+  .ov-item.is-active {
+    background: color-mix(in srgb, var(--tone) 13%, transparent);
+  }
+}
+
+.ov-item.is-empty {
+  opacity: 0.42;
+  cursor: default;
+}
+
+.ov-item.is-empty:hover {
+  background: rgba(255, 255, 255, 0.018);
+  border-color: var(--border-soft);
+}
+
+.ov-item-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11.5px;
+  font-weight: 550;
+  color: var(--muted);
+}
+
+.ov-item.is-active .ov-item-head {
+  color: var(--text);
+}
+
+.ov-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 3px;
+  background: var(--tone);
+  flex: 0 0 auto;
+}
+
+.ov-item-val {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.ov-item-val b {
+  font-size: 19px;
+  line-height: 1.1;
+  font-weight: 660;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+.ov-item-val span {
+  font-size: 11px;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.ov-mini {
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.07);
+  overflow: hidden;
+}
+
+.ov-mini i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--tone);
+  transition: width 0.4s ease;
+}
+
+/* 语义色 → --tone（复用 badge 的配色） */
+.badge-tone-ok { --tone: #37d67a; }
+.badge-tone-wait { --tone: #f2b544; }
+.badge-tone-run { --tone: #4f8cff; }
+.badge-tone-bad { --tone: #ff5f6d; }
+.badge-tone-skip { --tone: #8b93a7; }
+.badge-tone-local { --tone: #8a7df0; }
+
+.ov-pill.badge-tone-bad {
+  color: #ffa2aa;
+  background: rgba(255, 95, 109, 0.1);
+  border-color: rgba(255, 95, 109, 0.22);
+}
+
+.ov-pill.badge-tone-wait {
+  color: #ffd27a;
+  background: rgba(242, 181, 68, 0.1);
+  border-color: rgba(242, 181, 68, 0.22);
+}
+
+.ov-pill.badge-tone-ok {
+  color: #6ff0a8;
+  background: rgba(55, 214, 122, 0.1);
+  border-color: rgba(55, 214, 122, 0.22);
+}
+
+.ov.is-loading {
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  animation: soft-pulse 1.3s ease-in-out infinite;
+}
+
+.ov-skeleton-line { height: 30px; width: 210px; border-radius: 7px; background: rgba(255, 255, 255, 0.05); }
+.ov-skeleton-bar { height: 22px; border-radius: 7px; background: rgba(255, 255, 255, 0.05); }
+.ov-skeleton-legend { height: 62px; border-radius: 9px; background: rgba(255, 255, 255, 0.04); }
+
+.ov.is-error { padding: 18px; }
+
+/* 表格里的错误列 */
+.data-table .err-cell {
+  max-width: 260px;
+}
+
+.data-table .err-text {
+  display: block;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #ffa2aa;
+  font-size: 12px;
+  font-family: var(--mono);
+}
+
+/* 失败/待同步行：左缘着色 + 淡底 */
+.data-table tbody tr.row-failed {
+  background: rgba(255, 95, 109, 0.045);
+}
+
+.data-table tbody tr.row-failed td:first-child {
+  box-shadow: inset 3px 0 0 var(--bad);
+}
+
+.data-table tbody tr.row-pending td:first-child {
+  box-shadow: inset 3px 0 0 var(--warn);
+}
+
+.data-table tbody tr.row-failed:hover,
+.data-table tbody tr.row-pending:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+/* 分页栏里的状态标签 */
+.pager-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  background: none;
+  color: var(--tone);
+  font: inherit;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.pager-tag::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--tone);
+}
+
+.pager-tag:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+@media (max-width: 1024px) {
+  .ov-legend {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 640px) {
+  .ov-legend {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .ov-total b {
+    font-size: 26px;
+  }
+
+  .data-table .err-cell,
+  .data-table .err-text {
+    max-width: 160px;
+  }
+}
+
+/* --------------------------------------------------------------------------
    同步页 — 工具栏 / 表格 / 分页
    -------------------------------------------------------------------------- */
 
@@ -1288,12 +1673,277 @@ input[type="date"]::-webkit-calendar-picker-indicator {
 }
 
 .day-card:hover .day-arrow {
-  color: var(--accent);
+  color: var(--day-tone, var(--accent));
   transform: translateX(3px);
 }
 
+/* ---- 天状态着色：绿 = 已同步，黄 = 同步中，灰 = 未同步 ----------------
+   每张卡片由 app.js 加上 .tone-ok / .tone-warn / .tone-idle，
+   ::after 是左侧 3px 状态色条，其余配色都从 --day-tone-* 派生。 */
+
+.day-card.tone-ok {
+  --day-tone: var(--ok);
+  --day-tone-strong: #6ff0a8;
+  --day-tone-border: rgba(55, 214, 122, 0.42);
+  --day-tone-glow: rgba(55, 214, 122, 0.1);
+}
+
+.day-card.tone-warn {
+  --day-tone: var(--warn);
+  --day-tone-strong: #ffd27a;
+  --day-tone-border: rgba(242, 181, 68, 0.45);
+  --day-tone-glow: rgba(242, 181, 68, 0.12);
+}
+
+.day-card.tone-idle {
+  --day-tone: #6d7688;
+  --day-tone-strong: #c3cad7;
+  --day-tone-border: rgba(140, 150, 170, 0.38);
+  --day-tone-glow: rgba(140, 150, 170, 0.08);
+  background: linear-gradient(180deg, #171a21, #15181e);
+}
+
+.day-card::after {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: var(--day-tone, var(--accent));
+  opacity: 0.9;
+}
+
+.day-card:hover {
+  border-color: var(--day-tone-border, rgba(79, 140, 255, 0.4));
+  box-shadow: 0 22px 44px -28px rgba(0, 0, 0, 1), 0 0 0 1px var(--day-tone-glow, rgba(79, 140, 255, 0.06));
+}
+
+.day-card:focus-visible {
+  outline: 2px solid rgba(79, 140, 255, 0.7);
+  outline-offset: 2px;
+}
+
+/* 右上角状态胶囊 */
+.day-state {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 21px;
+  padding: 0 8px 0 6px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 620;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
+.day-state svg {
+  width: 12px;
+  height: 12px;
+}
+
+.day-card.tone-ok .day-state {
+  color: #6ff0a8;
+  background: rgba(55, 214, 122, 0.1);
+  border-color: rgba(55, 214, 122, 0.24);
+}
+
+.day-card.tone-warn .day-state {
+  color: #ffd27a;
+  background: rgba(242, 181, 68, 0.1);
+  border-color: rgba(242, 181, 68, 0.26);
+}
+
+.day-card.tone-warn .day-state svg {
+  animation: breathe 1.6s ease-in-out infinite;
+}
+
+.day-card.tone-idle .day-state {
+  color: #aeb6c6;
+  background: rgba(160, 170, 190, 0.08);
+  border-color: rgba(160, 170, 190, 0.2);
+}
+
+/* 段数 19/22 + 比例条 */
+.day-progress {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.day-count {
+  font-family: var(--mono);
+  font-size: 22px;
+  font-weight: 640;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+.day-count .done-part {
+  color: var(--day-tone-strong, var(--text));
+}
+
+.day-count .slash,
+.day-count .total-part {
+  color: var(--faint);
+  font-size: 18px;
+  font-weight: 520;
+}
+
+.day-count-label {
+  font-size: 11px;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+.day-flags {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.day-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--bad);
+  white-space: nowrap;
+}
+
+.day-flag.muted {
+  color: var(--muted);
+}
+
+.day-flag svg {
+  width: 12px;
+  height: 12px;
+}
+
+.day-bar {
+  position: relative;
+  height: 5px;
+  margin-top: 9px;
+  border-radius: 999px;
+  background: #242a35;
+  overflow: hidden;
+}
+
+.day-bar > i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: inherit;
+  background: var(--day-tone, var(--accent));
+}
+
+.day-card.tone-warn .day-bar > i {
+  background: repeating-linear-gradient(
+    115deg,
+    var(--warn) 0 7px,
+    rgba(242, 181, 68, 0.35) 7px 13px
+  );
+  background-size: 26px 100%;
+  animation: bar-run 1.1s linear infinite;
+}
+
+/* "今天"角标：只在最新一天且已同步时出现 */
+.day-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 17px;
+  margin-left: 6px;
+  padding: 0 6px;
+  border: 1px solid rgba(242, 181, 68, 0.24);
+  border-radius: 5px;
+  font-size: 10px;
+  font-weight: 620;
+  color: #ffd27a;
+  background: rgba(242, 181, 68, 0.1);
+}
+
+.day-live::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: breathe 1.1s ease-in-out infinite;
+}
+
+/* 汇总条：三种颜色的天数 + 图例 */
+.rec-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+
+.sum-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 28px;
+  padding: 0 11px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #161a21;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.sum-pill b {
+  color: var(--text);
+  font-weight: 640;
+  font-variant-numeric: tabular-nums;
+}
+
+.sum-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+.sum-pill.tone-ok .sum-dot {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px rgba(55, 214, 122, 0.14);
+}
+
+.sum-pill.tone-warn .sum-dot {
+  background: var(--warn);
+  box-shadow: 0 0 0 3px rgba(242, 181, 68, 0.14);
+}
+
+.sum-pill.tone-idle .sum-dot {
+  background: #6d7688;
+  box-shadow: 0 0 0 3px rgba(140, 150, 170, 0.12);
+}
+
+.rec-summary .legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  color: var(--faint);
+  font-size: 11.5px;
+}
+
+.rec-summary .legend svg {
+  width: 13px;
+  height: 13px;
+}
+
 .day-skeleton {
-  height: 194px;
+  height: 214px;
   border: 1px solid var(--border-soft);
   border-radius: var(--radius);
   background: var(--card);
@@ -1962,6 +2612,15 @@ input[type="date"]::-webkit-calendar-picker-indicator {
   }
   100% {
     background-position: -100% 0;
+  }
+}
+
+@keyframes bar-run {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 26px 0;
   }
 }
 
