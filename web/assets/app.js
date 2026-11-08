@@ -629,6 +629,9 @@
 
   var pollTimer = null;
   var pollBusy = false;
+  // statusSeen is false until the first /api/sync/status response has been
+  // adopted; the first response only establishes the baseline.
+  var statusSeen = false;
 
   // Poll quickly while a sync is running and back off when idle. The previous
   // fixed 2s interval produced ~43k requests/day per open tab.
@@ -686,11 +689,23 @@
   function applyStatus(next) {
     var previous = state.sync || {};
     var wasRunning = !!previous.running;
+    // state.sync starts as a hard-coded idle snapshot on every page load, so
+    // the first response is not a transition: a sync that is already running
+    // (auto sync, another tab) would otherwise announce itself with
+    // "同步已开始" as if this page had started it. Adopt the first response
+    // silently; every later poll compares against real prior state.
+    var first = !statusSeen;
+    statusSeen = true;
     state.sync = Object.assign({}, previous, next || {});
     updateIndicator();
 
     var hooks = state.statusHooks || {};
     if (typeof hooks.onStatus === 'function') hooks.onStatus(state.sync, wasRunning);
+
+    if (first) {
+      // Catching up with the server, not observing a change.
+      return;
+    }
 
     if (wasRunning && !state.sync.running) {
       if (typeof hooks.onFinished === 'function') hooks.onFinished(state.sync);
