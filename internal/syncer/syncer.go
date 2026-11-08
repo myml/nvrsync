@@ -12,7 +12,8 @@
 //  4. verify and record: non-empty file, 188-byte TS sync headers, sidecar
 //     JSON next to the file, then UpsertSegment{Status:"done"};
 //  5. retention: when RetentionD > 0, remove expired files that are both
-//     "done" and inside StorageDir.
+//     "done"/"local_only" and inside StorageDir, drop their index rows and
+//     the empty date directories they leave behind.
 //
 // Failures are retried twice with exponential backoff and then recorded as
 // "failed" with the error message. Progress is published through
@@ -36,6 +37,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/myml/nvrsync/internal/metrics"
 	"github.com/myml/nvrsync/internal/nvr"
 	"github.com/myml/nvrsync/internal/store"
 )
@@ -170,13 +172,16 @@ func New(st *store.Store) *Syncer {
 // Every path that logs in to the device or opens a media session must hold
 // this lock: sync runs, catalogue refreshes and on-demand scans.
 func (s *Syncer) acquireNVR(ctx context.Context, who string) (func(), error) {
+	waited := time.Now()
 	select {
 	case s.nvrSession <- struct{}{}:
 	default:
 		s.st.Log("info", who, fmt.Sprintf("%s 正在等待 NVR 会话（%s 占用中）", whoLabel(who), s.SessionHolder()))
 		select {
 		case s.nvrSession <- struct{}{}:
+			metrics.Default().ObserveSessionWait(time.Since(waited), true)
 		case <-ctx.Done():
+			metrics.Default().ObserveSessionWait(time.Since(waited), false)
 			return nil, ctx.Err()
 		}
 	}
@@ -718,7 +723,7 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 		if free < need+minFreeBytes {
 			s.st.LogCh(seg.Ch, "error", "download", fmt.Sprintf("%s 磁盘余量不足（剩 %s，需约 %s），保留为 pending",
 				label, humanBytes(free), humanBytes(need)))
-			_ = s.st.UpsertSegment(store.Segment{
+			_ = s.st.UpdateSegmentIfPresent(store.Segment{
 				Ch: seg.Ch, Start: seg.Start, End: seg.End,
 				Status: "pending", Err: "disk full",
 			})
@@ -731,8 +736,14 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 	s.st.LogCh(seg.Ch, "info", "download", fmt.Sprintf("%s 开始（NVR %s，本地 %s）", label, humanBytes(seg.Size), rel))
 
 	// Mark syncing so the UI shows the current work item. A cancelled run
-	// resets it to pending below.
-	_ = s.st.UpsertSegment(store.Segment{Ch: seg.Ch, Start: seg.Start, End: seg.End, Status: "syncing"})
+	// resets it to pending below. From here on the run only updates its own
+	// row: if retention removed it (the file it describes is gone), the
+	// download is abandoned instead of writing a file nobody indexed again.
+	if err := s.st.UpdateSegmentIfPresent(store.Segment{Ch: seg.Ch, Start: seg.Start, End: seg.End, Status: "syncing"}); err != nil {
+		metrics.Default().IncSegment(metrics.StatusSkipped)
+		s.st.LogCh(seg.Ch, "warn", "download", fmt.Sprintf("%s 索引已被移除，跳过下载: %v", label, err))
+		return
+	}
 
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -756,6 +767,9 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 		if err == nil {
 			busyStreak.Store(0)
 			took := time.Since(start)
+			metrics.Default().IncSegment(metrics.StatusDone)
+			metrics.Default().AddBytes(stats.Bytes)
+			metrics.Default().ObserveDownload(took)
 			p.addDone(stats.Bytes)
 			p.setCur("")
 			s.publish(p, true)
@@ -771,13 +785,17 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 			break
 		}
 		lastErr = err
+		if nvr.IsBusy(err) {
+			metrics.Default().IncNVRBusy()
+		}
 		p.setError(err)
 		s.st.LogCh(seg.Ch, "warn", "download", fmt.Sprintf("%s 下载失败: %v", label, err))
 	}
 
 	if ctx.Err() != nil {
 		// Leave the segment queued for the next run.
-		_ = s.st.UpsertSegment(store.Segment{Ch: seg.Ch, Start: seg.Start, End: seg.End, Status: "pending"})
+		_ = s.st.UpdateSegmentIfPresent(store.Segment{Ch: seg.Ch, Start: seg.Start, End: seg.End, Status: "pending"})
+		metrics.Default().IncSegment(metrics.StatusPending)
 		p.setCur("")
 		s.publish(p, true)
 		s.st.LogCh(seg.Ch, "warn", "download", label+" 已取消，保留为 pending")
@@ -791,10 +809,11 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 		// Leave the segment queued: marking thousands of segments failed just
 		// because the NVR ran out of sessions is what filled the index with
 		// 3,700 permanent-looking errors.
-		_ = s.st.UpsertSegment(store.Segment{
+		_ = s.st.UpdateSegmentIfPresent(store.Segment{
 			Ch: seg.Ch, Start: seg.Start, End: seg.End,
 			Status: "pending", Err: lastErr.Error(),
 		})
+		metrics.Default().IncSegment(metrics.StatusPending)
 		s.st.LogCh(seg.Ch, "warn", "download", label+" NVR 繁忙（-40401），保留为 pending")
 		if busyStreak.Add(1) >= maxBusyStreak {
 			trip()
@@ -804,11 +823,21 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 		return
 	}
 	busyStreak.Store(0)
+	if errors.Is(lastErr, store.ErrSegmentGone) {
+		// Retention removed the row while this download was running; the
+		// partial file was already cleaned up by attemptDownload.
+		metrics.Default().IncSegment(metrics.StatusSkipped)
+		s.st.LogCh(seg.Ch, "warn", "download", label+" 索引已被移除，放弃该段")
+		p.setCur("")
+		s.publish(p, true)
+		return
+	}
 	if errors.Is(lastErr, nvr.ErrNoMedia) {
-		_ = s.st.UpsertSegment(store.Segment{
+		_ = s.st.UpdateSegmentIfPresent(store.Segment{
 			Ch: seg.Ch, Start: seg.Start, End: seg.End,
 			Status: "skipped", Err: "NVR 上已无此段",
 		})
+		metrics.Default().IncSegment(metrics.StatusSkipped)
 		s.st.LogCh(seg.Ch, "warn", "download", label+" NVR 上已无此段，标记 skipped")
 		p.setCur("")
 		s.publish(p, true)
@@ -820,10 +849,11 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 		// pending so the next run picks it up, instead of filling the index
 		// with permanent-looking failures that would also be counted as
 		// "failed" in the UI.
-		_ = s.st.UpsertSegment(store.Segment{
+		_ = s.st.UpdateSegmentIfPresent(store.Segment{
 			Ch: seg.Ch, Start: seg.Start, End: seg.End,
 			Status: "pending", Err: lastErr.Error(),
 		})
+		metrics.Default().IncSegment(metrics.StatusPending)
 		s.st.LogCh(seg.Ch, "warn", "download", fmt.Sprintf("%s 暂时失败，保留为 pending: %v", label, lastErr))
 		p.setCur("")
 		s.publish(p, true)
@@ -835,7 +865,8 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 }
 
 func (s *Syncer) markFailed(seg store.Segment, err error) {
-	_ = s.st.UpsertSegment(store.Segment{
+	metrics.Default().IncSegment(metrics.StatusFailed)
+	_ = s.st.UpdateSegmentIfPresent(store.Segment{
 		Ch:       seg.Ch,
 		Start:    seg.Start,
 		End:      seg.End,
@@ -935,10 +966,15 @@ func (s *Syncer) attemptDownload(ctx context.Context, client *nvr.Client, storag
 		_ = os.Remove(abs + ".json")
 		return stats, err
 	}
-	if err := s.st.UpsertSegment(sc.Segment); err != nil {
-		// The file is valid; keeping it lets the next scan reuse the bytes
-		// only through a fresh download. Surface the metadata error so the
-		// segment is retried and the store is eventually consistent.
+	if err := s.st.UpdateSegmentIfPresent(sc.Segment); err != nil {
+		// The file is valid; the next scan can only reuse the bytes through a
+		// fresh download. Surface the metadata error so the segment is retried
+		// and the store is eventually consistent. A row retention removed is
+		// not retried: the file it describes was just deleted.
+		if errors.Is(err, store.ErrSegmentGone) {
+			_ = os.Remove(abs)
+			_ = os.Remove(abs + ".json")
+		}
 		return stats, fmt.Errorf("record segment: %w", err)
 	}
 	return stats, nil
@@ -1020,12 +1056,52 @@ func segmentPaths(storageDir string, seg store.Segment) (rel, abs string, err er
 // Retention
 // ---------------------------------------------------------------------------
 
+// retentionErrPrefix tags rows that retention retired, so
+// shouldPromoteSkipped never queues them again.
+const retentionErrPrefix = "retention:"
+
+// cleanupRetention removes recordings older than Settings.RetentionD and
+// retires their index rows.
+//
+// The two steps are deliberately conservative, because this is the only code
+// that deletes user data:
+//
+//   - a file is removed only when the row is "done"/"local_only", has a path
+//     that resolves inside StorageDir, and the segment start is older than the
+//     cutoff;
+//   - the row is deleted only when its file is confirmed gone. A row whose
+//     file could not be removed stays as it was, so a later run retries
+//     instead of orphaning bytes on disk;
+//   - rows are only ever deleted outside the catalogue window and outside the
+//     sync cutoff. Inside those windows the catalogue would see the footage on
+//     the NVR again, re-add it as "pending" and download it a second time.
+//
+// Deleting rather than marking rows "skipped" keeps the index from growing
+// forever: the table is scanned in full by Stats, Days and QueueSegments.
 func (s *Syncer) cleanupRetention(settings store.Settings) {
 	if settings.RetentionD <= 0 {
 		return
 	}
-	cutoff := time.Now().Unix() - int64(settings.RetentionD)*86400
-	removed := 0
+	now := time.Now()
+	cutoff := now.Unix() - int64(settings.RetentionD)*86400
+	// keepFrom is the oldest start retention must leave alone: anything the
+	// catalogue can still re-list, or the sync cutoff can still queue.
+	catalogDays := settings.CatalogDays
+	if catalogDays <= 0 {
+		catalogDays = defaultCatalogDays
+	}
+	keepFrom := now.AddDate(0, 0, -catalogDays).Unix()
+	if syncLimit := syncCutoff(settings, now.Unix()); syncLimit < keepFrom {
+		keepFrom = syncLimit
+	}
+	if cutoff < keepFrom {
+		// Retention is shorter than the window the catalogue/sync still walk.
+		// Deleting here would make the catalogue re-download what was just
+		// deleted, so the window wins.
+		keepFrom = cutoff
+	}
+
+	removed, keptRows, dirs := 0, 0, 0
 	// local_only rows have a local file too; omitting them leaked every file
 	// whose segment the NVR had already overwritten.
 	for _, status := range []string{"done", "local_only"} {
@@ -1045,20 +1121,72 @@ func (s *Syncer) cleanupRetention(settings store.Settings) {
 			if err := os.Remove(abs + ".json"); err != nil && !errors.Is(err, os.ErrNotExist) {
 				s.st.Log("warn", "scan", fmt.Sprintf("删除 sidecar %s.json 失败: %v", seg.Path, err))
 			}
-			if err := s.st.UpsertSegment(store.Segment{
-				Ch: seg.Ch, Start: seg.Start, End: seg.End,
-				Status: "skipped", Err: "retention: expired",
-			}); err != nil {
-				s.st.Log("warn", "scan", fmt.Sprintf("标记过期段失败: %v", err))
-			}
 			removed++
+
+			if seg.Start >= keepFrom {
+				// The catalogue could still re-list this footage; keep the row
+				// so it is not treated as new (and downloaded again).
+				keptRows++
+				continue
+			}
+			if err := s.st.DeleteSegment(seg.Ch, seg.Start, seg.End); err != nil {
+				s.st.Log("warn", "scan", fmt.Sprintf("删除过期段索引失败: %v", err))
+			}
 		}
 	}
 	if removed > 0 {
-		s.st.Log("info", "scan", fmt.Sprintf("保留清理：删除 %d 个过期文件（%d 天）", removed, settings.RetentionD))
-	} else {
-		s.st.Log("info", "scan", fmt.Sprintf("保留清理：无过期文件（%d 天）", settings.RetentionD))
+		dirs = s.cleanupEmptyDirs(settings.StorageDir)
 	}
+	s.st.Log("info", "scan", fmt.Sprintf("保留清理：删除 %d 个过期文件、清理 %d 个空目录（%d 天）",
+		removed, dirs, settings.RetentionD))
+	if keptRows > 0 {
+		s.st.Log("info", "scan", fmt.Sprintf("保留清理：%d 个过期文件的索引仍在对账/同步窗口内，行予以保留以免重复下载", keptRows))
+	}
+}
+
+// cleanupEmptyDirs removes date directories left empty after retention deleted
+// a whole day of footage. It only descends into <storage>/rec, never removes
+// the camN directories themselves, and stops at the first directory that still
+// holds a file. Errors are ignored: this is housekeeping.
+func (s *Syncer) cleanupEmptyDirs(storageDir string) int {
+	if strings.TrimSpace(storageDir) == "" {
+		return 0
+	}
+	root := filepath.Join(storageDir, "rec")
+	cams, err := os.ReadDir(root)
+	if err != nil {
+		return 0
+	}
+	removed := 0
+	for _, cam := range cams {
+		if !cam.IsDir() {
+			continue
+		}
+		camDir := filepath.Join(root, cam.Name())
+		days, err := os.ReadDir(camDir)
+		if err != nil {
+			continue
+		}
+		for _, day := range days {
+			if !day.IsDir() {
+				continue
+			}
+			dayDir := filepath.Join(camDir, day.Name())
+			entries, err := os.ReadDir(dayDir)
+			if err != nil || len(entries) != 0 {
+				continue
+			}
+			// Confirm the directory is still inside the storage root before
+			// removing it: a symlinked day directory could point anywhere.
+			if _, ok := pathUnderStorage(storageDir, filepath.ToSlash(filepath.Join("rec", cam.Name(), day.Name()))); !ok {
+				continue
+			}
+			if err := os.Remove(dayDir); err == nil {
+				removed++
+			}
+		}
+	}
+	return removed
 }
 
 // freeBytes reports the space available to an unprivileged writer.
@@ -1546,6 +1674,7 @@ func (s *Syncer) refreshCatalogDays(ctx context.Context, force, allowRunning boo
 		segs, err := mediaListRange(ctx, client, ch, from, to)
 		if err != nil {
 			if nvr.IsBusy(err) {
+				metrics.Default().IncNVRBusy()
 				s.st.LogCh(ch, "warn", "catalog", "NVR 繁忙（-40401），本轮跳过")
 				continue
 			}
@@ -1655,7 +1784,7 @@ func shouldPromoteSkipped(old store.Segment, ms nvr.MediaSeg, cutoff int64) bool
 	if ms.End <= ms.Start || ms.End > cutoff {
 		return false
 	}
-	if strings.HasPrefix(old.Err, "retention:") || old.Err == "empty time range" {
+	if strings.HasPrefix(old.Err, retentionErrPrefix) || old.Err == "empty time range" {
 		return false
 	}
 	return true

@@ -32,6 +32,7 @@
 | 3.2 | `GetUserIDContext` **可取消**的退避 | 取消不再干等 1s+2s，且重试梯子不再长时间持锁 |
 | 新增 | 登录**凭据错误立即停止探测端口** | 密码错时不再把 4 个端口 × 20s 超时全走一遍 |
 | 8.2 | `SyncState.Phase` → 前端显示等待原因 | 「正在等待 NVR 会话（对账占用中）」取代含糊的「准备队列…」 |
+| **9.2** | **`GET /api/metrics`（Prometheus 文本格式，无第三方依赖）** | 部分完成：暴露段结果计数、字节、`-40401` 次数、NVR 会话等待时长/次数、单段下载时长、抓取时计算的 `nvrsync_segments`/`nvrsync_queue_depth`/`nvrsync_sync_running`；数据库大小等仍未暴露 |
 
 回归测试：`syncer/session_lock_test.go`（并发探针断言 NVR 最高并发请求数 = 1）、
 `syncer/backoff_test.go`、`nvr/userid_test.go`、`api/settings_test.go`。已用 `-race` 验证。

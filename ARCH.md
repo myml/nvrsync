@@ -129,6 +129,7 @@ func (p *Player) EnsureProxy(ch int, date string) error           // 可选 ffmp
 | POST | `/api/sync/start` | `{channels,from,to,force}`（from/to 可省略=自动） |
 | POST | `/api/sync/stop` | |
 | GET | `/api/sync/status` | `{running,cur,phase,total,bytes,speed,started_at}`；`phase` 为 `queue`（建队列）/`waiting_nvr`（等待 NVR 会话） |
+| GET | `/api/metrics` | Prometheus 文本格式（`Content-Type: text/plain; version=0.0.4; charset=utf-8`）。计数器：`nvrsync_sync_segments_total{status="done\|failed\|skipped\|pending"}`、`nvrsync_sync_bytes_total`、`nvrsync_nvr_busy_total`（NVR 返回 -40401 的次数）、`nvrsync_nvr_session_wait_seconds_total` + `nvrsync_nvr_session_wait_count`（+`_aborted_total`：等待被取消的次数）、`nvrsync_download_seconds_total` + `nvrsync_download_count`；抓取时计算的 gauge：`nvrsync_segments{status=...}`（`syncing` 计入 `pending`）、`nvrsync_queue_depth`（pending+syncing+failed）、`nvrsync_sync_running`（0/1）、`nvrsync_uptime_seconds` |
 | GET | `/api/logs?limit=&level=` | 同步历史日志 |
 | GET | `/api/days?ch=` | `[{date,segments,seconds,bytes}]` |
 | GET | `/api/playlist?ch=&date=` | m3u8（`Content-Type: application/vnd.apple.mpegurl`） |
@@ -138,7 +139,7 @@ func (p *Player) EnsureProxy(ch int, date string) error           // 可选 ffmp
 
 启用登录保护（`auth_enabled=true`）后：
 
-- 免登录：`GET /login`、`/assets/*`（静态资源）、`POST /api/login`、`GET /api/health`；
+- 免登录：`GET /login`、`/assets/*`（静态资源）、`POST /api/login`、`GET /api/health`；`GET /api/metrics` **不免登录**（与其他 `/api/*` 一致）；
 - 其他 `/api/*` 未登录返回 `401 {"ok":false,"error":"unauthorized"}`；
 - 页面路径（`/`、`/sync`、`/recordings`、`/settings`、`/media/*` 等）未登录 302 到 `/login`；
 - 会话保存在内存（随进程重启失效），Cookie `nvrsync_session` 为 HttpOnly、SameSite=Lax、Path=/、MaxAge=24h；

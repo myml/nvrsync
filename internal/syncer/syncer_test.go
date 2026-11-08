@@ -254,50 +254,65 @@ func TestSyncDownloadsSegments(t *testing.T) {
 	}
 }
 
+// retentionSettings is the baseline every retention test starts from: a
+// 40-day window (the shortest one retention acts on) and a one-day catalogue,
+// so any expired segment is a full catalogue window old.
+func retentionSettings(storage string) store.Settings {
+	return store.Settings{StorageDir: storage, RetentionD: 40, CatalogDays: 1}
+}
+
+// mkSegmentFile writes a non-empty recording at rel below storage and returns
+// its absolute path. Created directories survive the call.
+func mkSegmentFile(t *testing.T, storage, rel string) string {
+	t.Helper()
+	p := filepath.Join(storage, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, tsPacketNull(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func mustUpsertSeg(t *testing.T, st *store.Store, seg store.Segment) {
+	t.Helper()
+	if err := st.UpsertSegment(seg); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRetentionOnlyDeletesDoneInsideStorage(t *testing.T) {
 	dataDir := t.TempDir()
 	st, err := store.Open(dataDir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { st.Close() })
 	storage := filepath.Join(dataDir, "storage")
-	old := time.Now().Add(-10 * 24 * time.Hour).Unix()
+	old := time.Now().Add(-365 * 24 * time.Hour).Unix()
 	recent := time.Now().Add(-time.Hour).Unix()
 
-	mk := func(rel string) string {
-		p := filepath.Join(storage, filepath.FromSlash(rel))
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(p, tsPacketNull(), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		return p
-	}
 	expiredRel := "rec/cam1/2000-01-01/00-00-00_00-01-00.ts"
-	expired := mk(expiredRel)
-	mk(expiredRel + ".json")
+	expired := mkSegmentFile(t, storage, expiredRel)
+	if err := os.WriteFile(expired+".json", []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	pendingRel := "rec/cam2/2000-01-01/00-00-00_00-01-00.ts"
-	pending := mk(pendingRel)
+	pending := mkSegmentFile(t, storage, pendingRel)
 	recentRel := "rec/cam3/2026-01-01/00-00-00_00-01-00.ts"
-	recentFile := mk(recentRel)
+	recentFile := mkSegmentFile(t, storage, recentRel)
 	outside := filepath.Join(dataDir, "outside.ts")
 	if err := os.WriteFile(outside, []byte("keep"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	mustUpsert := func(seg store.Segment) {
-		t.Helper()
-		if err := st.UpsertSegment(seg); err != nil {
-			t.Fatal(err)
-		}
-	}
-	mustUpsert(store.Segment{Ch: 1, Start: old, End: old + 60, Status: "done", Path: expiredRel, Bytes: 188})
-	mustUpsert(store.Segment{Ch: 2, Start: old, End: old + 60, Status: "pending", Path: pendingRel})
-	mustUpsert(store.Segment{Ch: 3, Start: recent, End: recent + 60, Status: "done", Path: recentRel, Bytes: 188})
-	mustUpsert(store.Segment{Ch: 4, Start: old, End: old + 60, Status: "done", Path: "../outside.ts", Bytes: 4})
+	mustUpsertSeg(t, st, store.Segment{Ch: 1, Start: old, End: old + 60, Status: "done", Path: expiredRel, Bytes: 188})
+	mustUpsertSeg(t, st, store.Segment{Ch: 2, Start: old, End: old + 60, Status: "pending", Path: pendingRel})
+	mustUpsertSeg(t, st, store.Segment{Ch: 3, Start: recent, End: recent + 60, Status: "done", Path: recentRel, Bytes: 188})
+	mustUpsertSeg(t, st, store.Segment{Ch: 4, Start: old, End: old + 60, Status: "done", Path: "../outside.ts", Bytes: 4})
 
-	New(st).cleanupRetention(store.Settings{StorageDir: storage, RetentionD: 7})
+	New(st).cleanupRetention(retentionSettings(storage))
 
 	if _, err := os.Stat(expired); !os.IsNotExist(err) {
 		t.Errorf("expired recording still exists: %v", err)
@@ -314,11 +329,257 @@ func TestRetentionOnlyDeletesDoneInsideStorage(t *testing.T) {
 	if _, err := os.Stat(outside); err != nil {
 		t.Errorf("file outside storage was deleted: %v", err)
 	}
-	if segs, _ := st.Segments(store.SegFilter{Ch: 1}); len(segs) != 1 || segs[0].Status != "skipped" {
-		t.Errorf("expired segment = %+v, want status skipped", segs)
+	if segs, _ := st.Segments(store.SegFilter{Ch: 1}); len(segs) != 0 {
+		t.Errorf("expired segment row = %+v, want it deleted", segs)
 	}
 	if segs, _ := st.Segments(store.SegFilter{Ch: 2}); len(segs) != 1 || segs[0].Status != "pending" {
 		t.Errorf("pending segment = %+v, want pending", segs)
+	}
+	if segs, _ := st.Segments(store.SegFilter{Ch: 3}); len(segs) != 1 || segs[0].Status != "done" {
+		t.Errorf("recent segment = %+v, want done and untouched", segs)
+	}
+	if segs, _ := st.Segments(store.SegFilter{Ch: 4}); len(segs) != 1 {
+		t.Errorf("out-of-storage segment row = %+v, want kept", segs)
+	}
+}
+
+// seedRetainedFile writes a fake recording (and sidecar) at the path
+// segmentPaths derives, so retention has something to remove.
+func seedRetainedFile(t *testing.T, storage string, seg store.Segment) string {
+	t.Helper()
+	rel, abs, err := segmentPaths(storage, seg)
+	if err != nil {
+		t.Fatalf("segmentPaths: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(abs, []byte("data"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if err := os.WriteFile(abs+".json", []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+	return rel
+}
+
+// TestRetentionDeletesRowsAndEmptyDirs is the regression test for the index
+// that only ever grew: expired rows used to be marked "skipped" and kept
+// forever, and the date directory they left behind stayed with them.
+func TestRetentionDeletesRowsAndEmptyDirs(t *testing.T) {
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := filepath.Join(dataDir, "storage")
+	// Older than the 30-day retention window and far outside the default
+	// 7-day catalogue window, so the row may go with the file.
+	start := time.Now().AddDate(0, 0, -90).Unix()
+	seg := store.Segment{Ch: 1, Start: start, End: start + 600, Status: "done", Path: ""}
+	rel := seedRetainedFile(t, storage, seg)
+	seg.Path = rel
+	if err := st.UpsertSegment(seg); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveSettings(store.Settings{
+		StorageDir: storage, Channels: []int{1}, RetentionD: 30,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	New(st).cleanupRetention(st.Settings())
+
+	if _, total := st.Segments(store.SegFilter{Ch: 1}); total != 0 {
+		t.Errorf("expired row survived retention: %d rows", total)
+	}
+	abs := filepath.Join(storage, filepath.FromSlash(rel))
+	if _, err := os.Stat(abs); !os.IsNotExist(err) {
+		t.Errorf("expired file still on disk: %v", err)
+	}
+	if _, err := os.Stat(abs + ".json"); !os.IsNotExist(err) {
+		t.Errorf("expired sidecar still on disk: %v", err)
+	}
+	// The emptied date directory goes, the camN directory stays.
+	if _, err := os.Stat(filepath.Dir(abs)); !os.IsNotExist(err) {
+		t.Errorf("empty date directory survived: %v", err)
+	}
+	camDir := filepath.Join(storage, "rec", "cam1")
+	if fi, err := os.Stat(camDir); err != nil || !fi.IsDir() {
+		t.Errorf("cam1 directory should still exist: %v", err)
+	}
+}
+
+// TestRetentionKeepsRowsInsideCatalogWindow pins the re-download guard: a file
+// older than the retention window but still inside the catalogue window has
+// its row kept, because the catalogue would otherwise re-add the segment as
+// pending and download it a second time.
+func TestRetentionKeepsRowsInsideCatalogWindow(t *testing.T) {
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := filepath.Join(dataDir, "storage")
+	start := time.Now().AddDate(0, 0, -20).Unix() // older than 10d retention, inside 90d catalogue
+	seg := store.Segment{Ch: 1, Start: start, End: start + 600, Status: "done"}
+	rel := seedRetainedFile(t, storage, seg)
+	seg.Path = rel
+	if err := st.UpsertSegment(seg); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveSettings(store.Settings{
+		StorageDir: storage, Channels: []int{1},
+		RetentionD: 10, CatalogDays: 90,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	New(st).cleanupRetention(st.Settings())
+
+	if _, total := st.Segments(store.SegFilter{Ch: 1}); total != 1 {
+		t.Fatalf("row inside the catalogue window was deleted; the catalogue would re-download it")
+	}
+	if _, err := os.Stat(filepath.Join(storage, filepath.FromSlash(rel))); !os.IsNotExist(err) {
+		t.Errorf("expired file should still be removed")
+	}
+}
+
+// TestRetentionSkipsSegmentsInsideWindow makes sure nothing inside the
+// retention window is touched at all.
+func TestRetentionSkipsSegmentsInsideWindow(t *testing.T) {
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := filepath.Join(dataDir, "storage")
+	start := time.Now().AddDate(0, 0, -2).Unix()
+	seg := store.Segment{Ch: 1, Start: start, End: start + 600, Status: "done"}
+	rel := seedRetainedFile(t, storage, seg)
+	seg.Path = rel
+	if err := st.UpsertSegment(seg); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveSettings(store.Settings{
+		StorageDir: storage, Channels: []int{1}, RetentionD: 30,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	New(st).cleanupRetention(st.Settings())
+
+	if _, err := os.Stat(filepath.Join(storage, filepath.FromSlash(rel))); err != nil {
+		t.Errorf("file inside the retention window was removed: %v", err)
+	}
+	if _, total := st.Segments(store.SegFilter{Ch: 1}); total != 1 {
+		t.Errorf("row inside the retention window was removed")
+	}
+}
+
+// TestRetentionKeepsRowWhenDeleteFails makes sure a row only disappears once
+// its file really is gone; otherwise the bytes would be orphaned on disk.
+func TestRetentionKeepsRowWhenDeleteFails(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root ignores directory permissions, so the delete cannot be made to fail")
+	}
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := filepath.Join(dataDir, "storage")
+	start := time.Now().AddDate(0, 0, -90).Unix()
+	seg := store.Segment{Ch: 1, Start: start, End: start + 600, Status: "done"}
+	rel := seedRetainedFile(t, storage, seg)
+	seg.Path = rel
+	if err := st.UpsertSegment(seg); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveSettings(store.Settings{
+		StorageDir: storage, Channels: []int{1}, RetentionD: 30,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Dir(filepath.Join(storage, filepath.FromSlash(rel)))
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	New(st).cleanupRetention(st.Settings())
+
+	if _, total := st.Segments(store.SegFilter{Ch: 1}); total != 1 {
+		t.Errorf("row was deleted even though its file could not be removed")
+	}
+}
+
+// TestRetentionIgnoresZeroAndDeletesOnlyExpired guards the off switch.
+func TestRetentionIgnoresZero(t *testing.T) {
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := filepath.Join(dataDir, "storage")
+	start := time.Now().AddDate(0, 0, -900).Unix()
+	seg := store.Segment{Ch: 1, Start: start, End: start + 600, Status: "done"}
+	rel := seedRetainedFile(t, storage, seg)
+	seg.Path = rel
+	if err := st.UpsertSegment(seg); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveSettings(store.Settings{
+		StorageDir: storage, Channels: []int{1}, RetentionD: 0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	New(st).cleanupRetention(st.Settings())
+
+	if _, err := os.Stat(filepath.Join(storage, filepath.FromSlash(rel))); err != nil {
+		t.Errorf("retention_days=0 removed a file: %v", err)
+	}
+	if _, total := st.Segments(store.SegFilter{Ch: 1}); total != 1 {
+		t.Errorf("retention_days=0 removed a row")
+	}
+}
+
+// TestCatalogDoesNotRedownloadRetainedSegment is the end-to-end guard: after
+// retention removed a file but kept its row (catalogue window), a catalogue
+// refresh must not queue it again.
+func TestCatalogDoesNotRedownloadRetainedSegment(t *testing.T) {
+	now := time.Now().Unix()
+	f := newFakeNVR(t, [][2]int64{{now - 3600, now - 3000}})
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := filepath.Join(t.TempDir(), "storage")
+	if err := st.SaveSettings(store.Settings{
+		NVRHost: f.host(), NVRUser: "admin", NVRPass: "secret", AdminPort: f.adminPort(),
+		StorageDir: storage, Channels: []int{1}, CatalogDays: 1, RetentionD: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The NVR still holds this segment; retention already deleted the file but
+	// had to keep the row because it is inside the catalogue window.
+	start := now - 3600
+	seg := store.Segment{Ch: 1, Start: start, End: start + 600, Status: "done"}
+	rel := seedRetainedFile(t, storage, seg)
+	seg.Path = rel
+	if err := st.UpsertSegment(seg); err != nil {
+		t.Fatal(err)
+	}
+
+	New(st).cleanupRetention(st.Settings())
+	if _, err := New(st).RefreshCatalogForce(context.Background(), true); err != nil {
+		t.Fatalf("catalogue refresh: %v", err)
+	}
+	for _, s := range []string{"pending", "syncing"} {
+		if segs, _ := st.Segments(store.SegFilter{Ch: 1, Status: s}); len(segs) != 0 {
+			t.Errorf("catalogue re-queued retained footage as %s: %+v", s, segs)
+		}
 	}
 }
 
