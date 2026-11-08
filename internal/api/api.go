@@ -308,21 +308,50 @@ func (s *server) handleNVRTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := nvr.New(set.NVRHost, set.NVRUser, set.NVRPass, set.AdminPort)
-	if err := client.Login(); err != nil {
-		writeError(w, http.StatusBadGateway, "login failed: "+err.Error())
-		return
-	}
-
 	ch := 1
 	if len(set.Channels) > 0 {
 		ch = set.Channels[0]
 	}
 	to := time.Now()
 	from := to.Add(-10 * time.Minute)
-	segments, err := client.MediaList(ch, from.Unix(), to.Unix())
-	if err != nil && !errors.Is(err, nvr.ErrNoMedia) {
-		writeError(w, http.StatusBadGateway, "media list failed: "+err.Error())
+
+	// A connection test is a real NVR activity (one login plus a media list
+	// query), so it must take the same global session lock as a sync, scan or
+	// catalogue refresh: clicking it mid-sync used to open a second session
+	// on a device with only stream_max_sessions=8 and earn a -40401. It
+	// queues behind the current holder and gives up when the client goes
+	// away.
+	var (
+		segments []nvr.MediaSeg
+		loginErr error
+		listErr  error
+	)
+	err := s.sy.WithNVRSession(r.Context(), "test", func() error {
+		client := nvr.New(set.NVRHost, set.NVRUser, set.NVRPass, set.AdminPort)
+		if err := client.Login(); err != nil {
+			loginErr = err
+			return nil
+		}
+		// ErrNoMedia just means "nothing recorded in the last 10 minutes",
+		// which is still a successful connection test.
+		segments, listErr = client.MediaListContext(r.Context(), ch, from.Unix(), to.Unix())
+		if errors.Is(listErr, nvr.ErrNoMedia) {
+			listErr = nil
+		}
+		return nil
+	})
+	if err != nil {
+		// Only a failed lock acquisition lands here (viewer gone or server
+		// shutting down); the device was never touched.
+		writeError(w, http.StatusBadGateway, "nvr session: "+err.Error())
+		return
+	}
+	if loginErr != nil {
+		writeError(w, http.StatusBadGateway, "login failed: "+loginErr.Error())
+		return
+	}
+	if listErr != nil {
+		writeError(w, http.StatusBadGateway, "media list failed: "+listErr.Error())
 		return
 	}
 

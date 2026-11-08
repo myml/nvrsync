@@ -190,6 +190,21 @@ func (s *Syncer) acquireNVR(ctx context.Context, who string) (func(), error) {
 	}, nil
 }
 
+// WithNVRSession runs fn while holding exclusive ownership of the NVR session
+// and releases it afterwards, even if fn panics. It is the public form of
+// acquireNVR for callers that live outside the sync loop (the API's "test
+// connection" button logs in and lists media exactly like a sync does), so
+// they queue behind — instead of competing with — a running sync, scan or
+// catalogue refresh for the device's small session budget.
+func (s *Syncer) WithNVRSession(ctx context.Context, who string, fn func() error) error {
+	release, err := s.acquireNVR(ctx, who)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return fn()
+}
+
 // SessionHolder reports which activity currently owns the NVR session, or ""
 // when the device is idle. It is for diagnostics and tests.
 func (s *Syncer) SessionHolder() string {
@@ -208,6 +223,8 @@ func whoLabel(who string) string {
 		return "对账"
 	case "scan":
 		return "扫描"
+	case "test":
+		return "测试连接"
 	default:
 		return who
 	}

@@ -3,6 +3,7 @@ package syncer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -220,6 +221,55 @@ func TestNVRSessionLockHonoursCancel(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("cancelled waiter did not return")
+	}
+}
+
+// TestWithNVRSessionQueuesBehindHolder pins the public lock wrapper the API
+// uses for "test connection": fn must not run while another activity owns the
+// session, and the holder must be reported as "test" meanwhile.
+func TestWithNVRSessionQueuesBehindHolder(t *testing.T) {
+	st := openSyncerStore(t)
+	s := New(st)
+	release, err := s.acquireNVR(context.Background(), "sync")
+	if err != nil {
+		t.Fatalf("acquireNVR: %v", err)
+	}
+
+	ran := make(chan string, 1)
+	go func() {
+		err := s.WithNVRSession(context.Background(), "test", func() error {
+			ran <- s.SessionHolder()
+			return nil
+		})
+		if err != nil {
+			ran <- "error: " + err.Error()
+		}
+	}()
+	select {
+	case got := <-ran:
+		t.Fatalf("WithNVRSession ran fn while the session was held (holder %q)", got)
+	case <-time.After(120 * time.Millisecond):
+	}
+
+	release()
+	select {
+	case got := <-ran:
+		if got != "test" {
+			t.Fatalf("fn ran with holder %q, want test", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WithNVRSession never ran fn after release")
+	}
+	// The lock must be free again, and a callback error must be propagated.
+	if got := s.SessionHolder(); got != "" {
+		t.Errorf("SessionHolder() after WithNVRSession = %q, want empty", got)
+	}
+	sentinel := errors.New("boom")
+	if err := s.WithNVRSession(context.Background(), "test", func() error { return sentinel }); !errors.Is(err, sentinel) {
+		t.Errorf("WithNVRSession error = %v, want %v", err, sentinel)
+	}
+	if got := s.SessionHolder(); got != "" {
+		t.Errorf("SessionHolder() after failing fn = %q, want empty (lock leaked)", got)
 	}
 }
 

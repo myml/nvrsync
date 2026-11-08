@@ -56,7 +56,7 @@ func (c *Client) MediaListContext(ctx context.Context, ch int, from, to int64) (
 	if to < from {
 		return nil, fmt.Errorf("nvr: media list: invalid range %d..%d", from, to)
 	}
-	uid, err := c.GetUserID()
+	uid, err := c.GetUserIDContext(ctx)
 	if err != nil {
 		return nil, err
 	}

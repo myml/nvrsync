@@ -70,6 +70,32 @@ func TestGetUserIDContextCancelsBackoff(t *testing.T) {
 	}
 }
 
+// TestMediaListContextCancelsUserIDBackoff pins that MediaListContext passes
+// its ctx down to get_user_id. With a plain GetUserID() the 1s+2s retry ladder
+// is uninterruptible, so cancelling a sync wedges inside MediaList for seconds
+// with the NVR session still held.
+func TestMediaListContextCancelsUserIDBackoff(t *testing.T) {
+	c, calls := newBusyNVR(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		for calls.Load() == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		cancel()
+	}()
+
+	start := time.Now()
+	_, err := c.MediaListContext(ctx, 1, 0, time.Now().Unix())
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("MediaListContext returned nil error for a busy NVR")
+	}
+	// A single backoff is 1s; cancellation must beat it comfortably.
+	if elapsed > 400*time.Millisecond {
+		t.Errorf("cancellation took %v, want MediaListContext to abort the backoff promptly", elapsed)
+	}
+}
+
 // TestGetUserIDContextRetriesBusy keeps the documented behaviour: a busy NVR is
 // retried (it is transient), and the error mentions the device code.
 func TestGetUserIDContextRetriesBusy(t *testing.T) {
