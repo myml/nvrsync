@@ -35,6 +35,11 @@ const (
 	defaultSegmentLimit = 5000
 )
 
+// DefaultSegmentScanLimit is a page large enough to hold the newest rows of a
+// channel that may hold weeks of 10-second segments. Callers that need "the
+// newest row" rather than page 1 use it as the Segments limit.
+const DefaultSegmentScanLimit = 50000
+
 // DefaultAuthUser is the login name used when Settings.AuthUser is empty.
 const DefaultAuthUser = "admin"
 
@@ -413,19 +418,64 @@ func (s *Store) Segments(f SegFilter) ([]Segment, int) {
 // same (Ch, Start, End) key. On merge, non-zero incoming fields replace the
 // stored values; a non-empty Status also replaces Err so that a successful
 // retry clears a previous error.
+//
+// A run in progress only ever *updates* ("syncing", then an outcome), never
+// inserts: its row is gone when the insert would have to match nothing.
+// Retention deletes expired rows, and without this guard a download it could
+// not see - a segment it had already re-scanned, or one whose start moved after
+// a clock re-sync - would put back a row for a file that is no longer on disk.
+// The download is abandoned instead (ErrSegmentGone), so the next catalogue
+// refresh decides from the NVR list what still has to be downloaded.
 func (s *Store) UpsertSegment(seg Segment) error {
-	_, err := s.db.Exec(upsertSegmentSQL,
-		seg.Ch, seg.Start, seg.End, seg.Size, seg.EventType, seg.Status,
-		seg.SyncedAt, seg.Path, seg.Bytes, seg.Err,
+	return s.upsertSegment(seg, false)
+}
+
+// UpdateSegmentIfPresent is UpsertSegment for a run that is already in
+// progress: it refuses to re-create a row that no longer exists and reports
+// ErrSegmentGone instead.
+func (s *Store) UpdateSegmentIfPresent(seg Segment) error {
+	return s.upsertSegment(seg, true)
+}
+
+func (s *Store) upsertSegment(seg Segment, existingOnly bool) error {
+	if !existingOnly {
+		if _, err := s.db.Exec(upsertSegmentSQL,
+			seg.Ch, seg.Start, seg.End, seg.Size, seg.EventType, seg.Status,
+			seg.SyncedAt, seg.Path, seg.Bytes, seg.Err,
+		); err != nil {
+			return fmt.Errorf("store: upsert segment: %w", err)
+		}
+		return nil
+	}
+	res, err := s.db.Exec(updateSegmentSQL,
+		seg.Size, seg.Size,
+		seg.EventType, seg.EventType,
+		seg.Status, seg.Status,
+		seg.SyncedAt, seg.SyncedAt,
+		seg.Path, seg.Path,
+		seg.Bytes, seg.Bytes,
+		seg.Status, seg.Err,
+		seg.Err, seg.Err,
+		seg.Ch, seg.Start, seg.End,
 	)
 	if err != nil {
-		return fmt.Errorf("store: upsert segment: %w", err)
+		return fmt.Errorf("store: update segment: %w", err)
+	}
+	// The row is either updated (1) or was not there (0); nothing is inserted.
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return ErrSegmentGone
 	}
 	return nil
 }
 
+// ErrSegmentGone reports that an in-progress run tried to write the result of
+// a segment whose index row no longer exists (removed by retention).
+var ErrSegmentGone = errors.New("store: segment row no longer exists")
+
 // DeleteSegment removes the segment identified by (ch, start, end). Deleting a
-// missing segment is not an error.
+// missing segment is not an error. Retention uses it to retire rows whose file
+// is gone; an in-progress sync then only updates rows and cannot re-create
+// them (see UpdateSegmentIfPresent).
 func (s *Store) DeleteSegment(ch int, start, end int64) error {
 	_, err := s.db.Exec(
 		"DELETE FROM segments WHERE ch = ? AND start_ts = ? AND end_ts = ?",

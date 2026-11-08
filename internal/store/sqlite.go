@@ -33,6 +33,28 @@ ON CONFLICT(ch, start_ts, end_ts) DO UPDATE SET
 	END
 `
 
+// updateSegmentSQL merges non-zero incoming fields into an existing row and
+// does nothing when there is none: it is the same merge as upsertSegmentSQL,
+// minus the insert. It is a separate statement on purpose - a WHERE attached
+// to an INSERT ... ON CONFLICT ... DO UPDATE binds to the conflict action, not
+// to the insert, and then reports "no row" for a row that does exist.
+// Arguments: the ten segment fields followed by the (ch, start_ts, end_ts) key.
+const updateSegmentSQL = `
+UPDATE segments SET
+	size = CASE WHEN ? <> 0 THEN ? ELSE size END,
+	event_type = CASE WHEN ? <> 0 THEN ? ELSE event_type END,
+	status = CASE WHEN ? <> '' THEN ? ELSE status END,
+	synced_at = CASE WHEN ? <> 0 THEN ? ELSE synced_at END,
+	path = CASE WHEN ? <> '' THEN ? ELSE path END,
+	bytes = CASE WHEN ? <> 0 THEN ? ELSE bytes END,
+	err = CASE
+		WHEN ? <> '' THEN ?
+		WHEN ? <> '' THEN ?
+		ELSE err
+	END
+WHERE ch = ? AND start_ts = ? AND end_ts = ?
+`
+
 // schemaTables must run before schemaIndexes: a database created by an older
 // build can have a logs table without the ch column, and creating the ch index
 // before the migration would fail.

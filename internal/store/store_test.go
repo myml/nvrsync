@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -533,6 +534,61 @@ func TestDeleteSegment(t *testing.T) {
 	reopened := openStoreAt(t, dir)
 	if _, total := reopened.Segments(SegFilter{}); total != 2 {
 		t.Errorf("reopened total after delete = %d, want 2", total)
+	}
+}
+
+// TestUpdateSegmentIfPresent pins the two halves of the guarded write: both
+// paths merge exactly like UpsertSegment, but only UpdateSegmentIfPresent
+// refuses to insert, and it reports ErrSegmentGone precisely when the row is
+// missing. A plain `WHERE` on the upsert used to bind to the conflict action
+// and report "gone" even for a row that existed.
+func TestUpdateSegmentIfPresent(t *testing.T) {
+	s := openStoreAt(t, t.TempDir())
+	mustUpsert(t, s, Segment{Ch: 1, Start: 100, End: 200, Status: "pending", Size: 10})
+
+	// An existing row is updated, never reported missing.
+	if err := s.UpdateSegmentIfPresent(Segment{Ch: 1, Start: 100, End: 200, Status: "syncing"}); err != nil {
+		t.Fatalf("UpdateSegmentIfPresent on an existing row: %v", err)
+	}
+	got := findSegment(t, s, 1, 100, 200)
+	if got.Status != "syncing" || got.Size != 10 {
+		t.Errorf("row after update = %+v, want status syncing and size kept at 10", got)
+	}
+
+	// The merge rules still hold: zero fields keep the stored value, a
+	// non-empty Status clears Err even when the incoming Err is empty.
+	mustUpsert(t, s, Segment{Ch: 1, Start: 300, End: 400, Status: "failed", Err: "boom", Path: "rec/a.ts"})
+	if err := s.UpdateSegmentIfPresent(Segment{Ch: 1, Start: 300, End: 400, Status: "done", Bytes: 5}); err != nil {
+		t.Fatalf("UpdateSegmentIfPresent merge: %v", err)
+	}
+	got = findSegment(t, s, 1, 300, 400)
+	if got.Status != "done" || got.Err != "" || got.Path != "rec/a.ts" || got.Bytes != 5 {
+		t.Errorf("merged row = %+v, want done, no err, path kept, 5 bytes", got)
+	}
+
+	// The same fields on a missing row insert nothing.
+	if err := s.UpdateSegmentIfPresent(Segment{Ch: 1, Start: 500, End: 600, Status: "syncing"}); !errors.Is(err, ErrSegmentGone) {
+		t.Errorf("UpdateSegmentIfPresent on a missing row = %v, want ErrSegmentGone", err)
+	}
+	if _, total := s.Segments(SegFilter{}); total != 2 {
+		t.Errorf("total after missing update = %d, want 2 (nothing inserted)", total)
+	}
+
+	// A row retention removed while a run was busy with it cannot come back.
+	if err := s.DeleteSegment(1, 100, 200); err != nil {
+		t.Fatalf("DeleteSegment: %v", err)
+	}
+	if err := s.UpdateSegmentIfPresent(Segment{Ch: 1, Start: 100, End: 200, Status: "done", Path: "rec/gone.ts", Bytes: 188}); !errors.Is(err, ErrSegmentGone) {
+		t.Errorf("update of a deleted row = %v, want ErrSegmentGone", err)
+	}
+	if _, total := s.Segments(SegFilter{Ch: 1, From: 1, To: 250}); total != 0 {
+		t.Errorf("deleted row was re-created by an update")
+	}
+
+	// UpsertSegment itself still inserts.
+	mustUpsert(t, s, Segment{Ch: 1, Start: 100, End: 200, Status: "pending"})
+	if _, total := s.Segments(SegFilter{}); total != 2 {
+		t.Errorf("total after re-upsert = %d, want 2", total)
 	}
 }
 
