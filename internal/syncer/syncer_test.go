@@ -651,3 +651,100 @@ func openSyncerStore(t *testing.T) *store.Store {
 	})
 	return st
 }
+
+// TestSyncTruncatedStaysPending pins the "a hiccup is not a verdict" rule: when
+// the device drops the stream without a finished notice, the segment must
+// remain pending for the next run instead of being recorded as failed. Filling
+// the index with permanent failures for retryable errors is what made the
+// failure count look out of control.
+func TestSyncTruncatedStaysPending(t *testing.T) {
+	// Keep the retry loop short: the production backoff is 10s+20s.
+	oldRetry, oldBusy, oldTransient := retryBase, busyRetryBase, transientRetryBase
+	retryBase, busyRetryBase, transientRetryBase = 5*time.Millisecond, 5*time.Millisecond, 5*time.Millisecond
+	t.Cleanup(func() { retryBase, busyRetryBase, transientRetryBase = oldRetry, oldBusy, oldTransient })
+
+	f := newFakeNVRBase(t, [][2]int64{{0, 0}})
+	// Serve video then close the connection without "finished": the client
+	// reports ErrTruncated.
+	go func() {
+		for {
+			conn, err := f.ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+				if _, err := readHead(br); err != nil {
+					return
+				}
+				fmt.Fprint(c, "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest nonce=\"n\"\r\nContent-Length: 0\r\n\r\n")
+				if _, err := readHead(br); err != nil {
+					return
+				}
+				fmt.Fprint(c, "HTTP/1.0 200 OK\r\nContent-Type: multipart/mixed;boundary=--device--\r\n\r\n")
+				body := append(tsPacketNull(), tsPacketNull()...)
+				fmt.Fprintf(c, "----device--\r\nContent-Type: video/mp2t\r\nContent-Length: %d\r\n\r\n", len(body))
+				c.Write(body)
+				io.WriteString(c, "\r\n")
+				// No finished part: the connection just ends.
+			}(conn)
+		}
+	}()
+
+	now := time.Now().Unix()
+	dataDir := t.TempDir()
+	st, err := store.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := filepath.Join(dataDir, "storage")
+	if err := os.MkdirAll(storage, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveSettings(store.Settings{
+		NVRHost: f.host(), NVRUser: "admin", NVRPass: "secret",
+		AdminPort: f.adminPort(), StorageDir: storage,
+		Channels: []int{1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertSegment(store.Segment{Ch: 1, Start: now - 900, End: now - 780, Status: "pending"}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(st)
+	if err := s.Start(SyncRequest{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// This run intentionally downloads nothing, so wait for it to finish
+	// rather than for waitDone's "everything downloaded" condition.
+	deadline := time.Now().Add(10 * time.Second)
+	for s.Running() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if s.Running() {
+		t.Fatalf("sync did not finish: %+v", st.SyncState())
+	}
+
+	segs, _ := st.Segments(store.SegFilter{Ch: 1})
+	if len(segs) != 1 {
+		t.Fatalf("segments = %d, want 1", len(segs))
+	}
+	if segs[0].Status != "pending" {
+		t.Fatalf("truncated segment status = %q (err %q), want pending", segs[0].Status, segs[0].Err)
+	}
+	if !strings.Contains(segs[0].Err, "truncated") {
+		t.Fatalf("err = %q, want it to record the truncation", segs[0].Err)
+	}
+	// Nothing partial may be left on disk.
+	if _, err := os.Stat(filepath.Join(storage, "rec")); err == nil {
+		_ = filepath.Walk(filepath.Join(storage, "rec"), func(p string, info os.FileInfo, err error) error {
+			if err == nil && info != nil && !info.IsDir() {
+				t.Errorf("partial file left behind: %s", p)
+			}
+			return nil
+		})
+	}
+}

@@ -30,6 +30,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -49,6 +50,45 @@ var ErrTruncated = errors.New("nvr: download truncated")
 // ErrInvalidTS means the downloaded bytes are not a clean 188-byte TS
 // stream (bad sync byte, partial packet, or no packets at all).
 var ErrInvalidTS = errors.New("nvr: download is not a valid transport stream")
+
+// ErrEmpty means the device said "finished" without sending any video part.
+//
+// This is deliberately *not* ErrNoMedia: ErrNoMedia ("the device has no
+// recording for this range") is permanent and the syncer marks the segment
+// skipped, whereas an empty but finished stream is usually a device hiccup and
+// must stay retryable.
+var ErrEmpty = errors.New("nvr: download finished with no data")
+
+// IsTransient reports whether err is a device- or network-side hiccup that is
+// worth retrying, rather than a permanent condition. The syncer keeps such
+// segments pending instead of recording them as failed: a truncated stream, an
+// idle timeout or a broken handshake says nothing about whether the recording
+// can be fetched later.
+//
+// ErrNoMedia is permanent and therefore *not* transient.
+func IsTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch {
+	case errors.Is(err, ErrTruncated), errors.Is(err, ErrInvalidTS), errors.Is(err, ErrEmpty):
+		return true
+	case errors.Is(err, context.Canceled):
+		// A cancelled run is handled separately; not a permanent failure.
+		return true
+	case errors.Is(err, ErrNoMedia):
+		return false
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	// Connection resets, EOF during the handshake and similar transport
+	// errors are transient too.
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNREFUSED)
+}
 
 // DownloadOpt controls flow-control pacing and timeouts.
 //
@@ -296,7 +336,7 @@ readLoop:
 		}
 		return stats, fmt.Errorf("nvr: download: %s after %d bytes: %w", stopReason, stats.Bytes, ErrTruncated)
 	case stats.Bytes == 0:
-		return stats, fmt.Errorf("nvr: download: finished with no data: %w", ErrNoMedia)
+		return stats, fmt.Errorf("nvr: download: finished with no data: %w", ErrEmpty)
 	case probe.syncErrors > 0 || len(probe.buf) > 0 || probe.packets == 0:
 		return stats, fmt.Errorf("nvr: download: %w (packets=%d, sync_errors=%d, trailing=%d)",
 			ErrInvalidTS, probe.packets, probe.syncErrors, len(probe.buf))

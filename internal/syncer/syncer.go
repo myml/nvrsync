@@ -45,10 +45,6 @@ const (
 	downloadWorkers = 2
 	// maxAttempts includes the first try: two retries after a failure.
 	maxAttempts = 3
-	retryBase   = 2 * time.Second
-	// busyRetryBase is used for the NVR's -40401 ("no session budget") reply.
-	// It is transient; hammering the device with 2s retries makes it worse.
-	busyRetryBase = 10 * time.Second
 	// maxBusyStreak stops one run after this many consecutive busy failures,
 	// so a saturated NVR does not turn the whole queue into retries.
 	maxBusyStreak = 8
@@ -66,6 +62,21 @@ const (
 	// downloading it now would persist a truncated file whose tail the
 	// watermark then skips forever.
 	liveGuard = 120 // seconds
+)
+
+// Retry pacing. These are variables rather than constants so tests can shorten
+// the retry loop; production code never changes them.
+var (
+	// retryBase is the backoff for an ordinary failure.
+	retryBase = 2 * time.Second
+	// busyRetryBase is used for the NVR's -40401 ("no session budget") reply.
+	// It is transient; hammering the device with 2s retries makes it worse.
+	busyRetryBase = 10 * time.Second
+	// transientRetryBase is used for device/network hiccups (truncated stream,
+	// idle timeout, broken handshake). These say nothing about whether the
+	// segment can be fetched later, so they back off much longer than a plain
+	// retry and the segment stays pending instead of being marked failed.
+	transientRetryBase = 10 * time.Second
 )
 
 // ErrAlreadyRunning is returned by Start when a sync is already in flight.
@@ -579,6 +590,8 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 			delay := retryBase << (attempt - 1)
 			if nvr.IsBusy(lastErr) {
 				delay = busyRetryBase << (attempt - 1)
+			} else if nvr.IsTransient(lastErr) {
+				delay = transientRetryBase << (attempt - 1)
 			}
 			s.st.LogCh(seg.Ch, "warn", "download", fmt.Sprintf("%s 第 %d 次重试（等待 %s）", label, attempt, delay))
 			if !sleepCtx(ctx, delay) {
@@ -647,6 +660,21 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 			Status: "skipped", Err: "NVR 上已无此段",
 		})
 		s.st.LogCh(seg.Ch, "warn", "download", label+" NVR 上已无此段，标记 skipped")
+		p.setCur("")
+		s.publish(p, true)
+		return
+	}
+	if nvr.IsTransient(lastErr) {
+		// A truncated stream, an idle timeout or a broken handshake is a
+		// device/network hiccup, not a verdict on the segment. Keep it
+		// pending so the next run picks it up, instead of filling the index
+		// with permanent-looking failures that would also be counted as
+		// "failed" in the UI.
+		_ = s.st.UpsertSegment(store.Segment{
+			Ch: seg.Ch, Start: seg.Start, End: seg.End,
+			Status: "pending", Err: lastErr.Error(),
+		})
+		s.st.LogCh(seg.Ch, "warn", "download", fmt.Sprintf("%s 暂时失败，保留为 pending: %v", label, lastErr))
 		p.setCur("")
 		s.publish(p, true)
 		return
@@ -1115,6 +1143,11 @@ func mediaListRange(ctx context.Context, client *nvr.Client, ch int, from, to in
 		case errors.Is(err, nvr.ErrNoMedia):
 			// no recording in this slice
 		case err != nil:
+			// Keep what earlier (newer) days already returned instead of
+			// throwing the whole listing away: losing a multi-day listing to
+			// one bad day makes the reconcile loop look like it never
+			// succeeds. The day walk stops here and the caller reports the
+			// error alongside the partial result.
 			return out, err
 		default:
 			emptyStreak = 0
@@ -1254,8 +1287,12 @@ func (s *Syncer) refreshCatalogDays(ctx context.Context, force, allowRunning boo
 				s.st.LogCh(ch, "warn", "catalog", "NVR 繁忙（-40401），本轮跳过")
 				continue
 			}
-			s.st.LogCh(ch, "error", "catalog", fmt.Sprintf("列出录像失败: %v", err))
-			continue
+			// mediaListRange may return the days it already listed before
+			// the failing one; use them rather than discarding the channel.
+			s.st.LogCh(ch, "warn", "catalog", fmt.Sprintf("列出录像中断（已获 %d 段，继续对账）: %v", len(segs), err))
+			if len(segs) == 0 {
+				continue
+			}
 		}
 		segs = dropCoveredClips(segs)
 

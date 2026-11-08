@@ -3,6 +3,7 @@ package nvr
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -307,3 +308,35 @@ func TestDownloadTruncated(t *testing.T) {
 		t.Fatalf("Download error = %v, want ErrTruncated", err)
 	}
 }
+
+// IsTransient must treat device/network hiccups as retryable and keep
+// "the device has no recording" permanent, so the syncer does not turn a
+// truncated stream into a permanent failed segment.
+func TestIsTransient(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"truncated", fmt.Errorf("nvr: download: idle-timeout after 10 bytes: %w", ErrTruncated), true},
+		{"invalid-ts", fmt.Errorf("nvr: download: %w", ErrInvalidTS), true},
+		{"empty", fmt.Errorf("nvr: download: finished with no data: %w", ErrEmpty), true},
+		{"no-media", fmt.Errorf("nvr: download: device reported no data (eof): %w", ErrNoMedia), false},
+		{"timeout", fmt.Errorf("nvr: download: read response: %w", timeoutErr{}), true},
+		{"eof", fmt.Errorf("nvr: stream handshake: %w", io.EOF), true},
+		{"cancelled", fmt.Errorf("nvr: download: %w", context.Canceled), true},
+		{"permanent", errors.New("nvr: download: Content-Length out of range: 1"), false},
+	}
+	for _, c := range cases {
+		if got := IsTransient(c.err); got != c.want {
+			t.Errorf("IsTransient(%s) = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string   { return "i/o timeout" }
+func (timeoutErr) Timeout() bool   { return true }
+func (timeoutErr) Temporary() bool { return true }
