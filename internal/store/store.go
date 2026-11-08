@@ -114,13 +114,44 @@ type SyncState struct {
 	LastError string  `json:"last_error"`
 }
 
-// DayInfo is a per-day aggregate of successfully synced segments.
+// DayInfo is a per-day aggregate of the segments indexed for that day.
+//
+// Segments/Seconds/Bytes/Chs describe the locally playable material only
+// (done + local_only rows) and keep their historical meaning. Total and the
+// per-status counters additionally cover the rows that are not downloaded yet,
+// so a client can show a day as "19/22 segments synced".
 type DayInfo struct {
 	Date     string `json:"date"`
 	Chs      int    `json:"chs"`
 	Segments int    `json:"segments"`
 	Seconds  int64  `json:"seconds"`
 	Bytes    int64  `json:"bytes"`
+
+	// Total is every row known for the day:
+	// Local + Syncing + Pending + Failed + Skipped.
+	Total   int `json:"total"`
+	Local   int `json:"local"`
+	Syncing int `json:"syncing"`
+	Pending int `json:"pending"`
+	Failed  int `json:"failed"`
+	Skipped int `json:"skipped"`
+}
+
+// dayHasWork reports whether the day still has rows that are not downloaded.
+// local_only rows never turn into done (the NVR lost them), so they are not
+// counted as remaining work.
+func (d DayInfo) dayHasWork() bool {
+	return d.Syncing+d.Pending+d.Failed+d.Skipped > 0
+}
+
+// DaySynced reports whether every row of the day is downloaded.
+func (d DayInfo) DaySynced() bool {
+	return d.Local > 0 && !d.dayHasWork()
+}
+
+// DaySyncing reports whether the day has a download running or queued.
+func (d DayInfo) DaySyncing() bool {
+	return d.Syncing+d.Pending > 0
 }
 
 // SegFilter selects and paginates segments.
@@ -452,13 +483,18 @@ func (s *Store) Logs(limit int, level string, ch int) []LogEntry {
 	return out
 }
 
-// Days aggregates successfully synced segments by local calendar day, newest
-// day first. A non-zero ch restricts the result to that channel.
+// Days aggregates indexed segments by local calendar day, newest day first. A
+// non-zero ch restricts the result to that channel.
 //
-// Seconds are the union of the playable intervals per channel, not the sum of
-// every row: a motion clip and the continuous recording containing it must not
-// make a day look twice as long. Bytes still sum every file because overlapping
-// segments really do occupy disk.
+// Only done and local_only rows contribute to the local totals
+// (Segments/Seconds/Bytes/Chs). Seconds are the union of the playable intervals
+// per channel, not the sum of every row: a motion clip and the continuous
+// recording containing it must not make a day look twice as long. Bytes still
+// sum every file because overlapping segments really do occupy disk.
+//
+// The per-status counters and Total cover every known row of the day, so a day
+// whose segments are still queued shows up with Total > Local instead of being
+// missing from the list.
 func (s *Store) Days(ch int) []DayInfo {
 	type aggregate struct {
 		chs      map[int]struct{}
@@ -466,12 +502,16 @@ func (s *Store) Days(ch int) []DayInfo {
 		seconds  int64
 		bytes    int64
 		lastEnd  map[int]int64
+		local    int
+		syncing  int
+		pending  int
+		failed   int
+		skipped  int
 	}
-	query := "SELECT ch, start_ts, end_ts, bytes FROM segments " +
-		"WHERE status IN ('done', 'local_only')"
+	query := "SELECT ch, start_ts, end_ts, bytes, status FROM segments"
 	args := []any{}
 	if ch != 0 {
-		query += " AND ch = ?"
+		query += " WHERE ch = ?"
 		args = append(args, ch)
 	}
 	// A single ordered scan lets us merge overlapping intervals in O(n).
@@ -490,8 +530,9 @@ func (s *Store) Days(ch int) []DayInfo {
 			start int64
 			end   int64
 			bytes int64
+			st    string
 		)
-		if err := rows.Scan(&segCh, &start, &end, &bytes); err != nil {
+		if err := rows.Scan(&segCh, &start, &end, &bytes, &st); err != nil {
 			break
 		}
 		date := time.Unix(start, 0).In(time.Local).Format("2006-01-02")
@@ -503,22 +544,41 @@ func (s *Store) Days(ch int) []DayInfo {
 			}
 			days[date] = agg
 		}
+		switch st {
+		case "done", "local_only":
+			agg.local++
+		case "syncing":
+			agg.syncing++
+		case "pending":
+			agg.pending++
+		case "failed":
+			agg.failed++
+		case "skipped":
+			agg.skipped++
+		default:
+			// Unknown status: count it as work still to do rather than
+			// silently dropping the row from the day.
+			agg.pending++
+		}
+		if st != "done" && st != "local_only" {
+			continue
+		}
+		if end > start {
+			prevEnd := agg.lastEnd[segCh]
+			from := start
+			if from < prevEnd {
+				from = prevEnd
+			}
+			if end > from {
+				agg.seconds += end - from
+			}
+			if end > prevEnd {
+				agg.lastEnd[segCh] = end
+			}
+		}
 		agg.chs[segCh] = struct{}{}
 		agg.segments++
 		agg.bytes += bytes
-		if end <= start {
-			continue
-		}
-		prevEnd := agg.lastEnd[segCh]
-		if start < prevEnd {
-			start = prevEnd
-		}
-		if end > start {
-			agg.seconds += end - start
-		}
-		if end > prevEnd {
-			agg.lastEnd[segCh] = end
-		}
 	}
 
 	out := make([]DayInfo, 0, len(days))
@@ -529,6 +589,12 @@ func (s *Store) Days(ch int) []DayInfo {
 			Segments: agg.segments,
 			Seconds:  agg.seconds,
 			Bytes:    agg.bytes,
+			Total:    agg.local + agg.syncing + agg.pending + agg.failed + agg.skipped,
+			Local:    agg.local,
+			Syncing:  agg.syncing,
+			Pending:  agg.pending,
+			Failed:   agg.failed,
+			Skipped:  agg.skipped,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Date > out[j].Date })

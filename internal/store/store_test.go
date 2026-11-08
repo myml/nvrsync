@@ -612,14 +612,16 @@ func TestDaysAggregatesLocalDates(t *testing.T) {
 		day21 = "2026-10-21"
 	)
 	for _, seg := range []Segment{
-		// 2026-10-20: two channels, done/local_only, one failed.
+		// 2026-10-20: two channels, done/local_only, one failed, one pending.
 		{Ch: 1, Start: at(20, 23), End: at(21, 0), Status: "done", Bytes: 100},
 		{Ch: 2, Start: at(20, 5), End: at(20, 6), Status: "done", Bytes: 50},
 		{Ch: 1, Start: at(20, 7), End: at(20, 8), Status: "local_only", Bytes: 25},
 		{Ch: 1, Start: at(20, 9), End: at(20, 10), Status: "failed", Bytes: 9999},
+		{Ch: 1, Start: at(20, 11), End: at(20, 12), Status: "pending", Bytes: 0},
 		// 2026-10-21: one done segment on channel 1.
 		{Ch: 1, Start: at(21, 7), End: at(21, 8), Status: "done", Bytes: 30},
-		// Wrong-case status is ignored.
+		// Wrong-case status is not a local segment, but the row must not
+		// disappear from its day either: it counts as still to download.
 		{Ch: 1, Start: at(22, 7), End: at(22, 8), Status: "DONE", Bytes: 1},
 	} {
 		mustUpsert(t, s, seg)
@@ -627,8 +629,13 @@ func TestDaysAggregatesLocalDates(t *testing.T) {
 
 	days := s.Days(0)
 	want := []DayInfo{
-		{Date: day21, Chs: 1, Segments: 1, Seconds: 3600, Bytes: 30},
-		{Date: day20, Chs: 2, Segments: 3, Seconds: 3 * 3600, Bytes: 175},
+		{Date: "2026-10-22", Total: 1, Pending: 1},
+		{Date: day21, Chs: 1, Segments: 1, Seconds: 3600, Bytes: 30,
+			Total: 1, Local: 1},
+		// Local stats only count done/local_only; the failed and pending
+		// rows add to Total but not to Bytes or Seconds.
+		{Date: day20, Chs: 2, Segments: 3, Seconds: 3 * 3600, Bytes: 175,
+			Total: 5, Local: 3, Failed: 1, Pending: 1},
 	}
 	if !reflect.DeepEqual(days, want) {
 		t.Fatalf("Days() = %+v, want %+v", days, want)
@@ -636,14 +643,18 @@ func TestDaysAggregatesLocalDates(t *testing.T) {
 
 	ch1 := s.Days(1)
 	wantCh1 := []DayInfo{
-		{Date: day21, Chs: 1, Segments: 1, Seconds: 3600, Bytes: 30},
-		{Date: day20, Chs: 1, Segments: 2, Seconds: 2 * 3600, Bytes: 125},
+		{Date: "2026-10-22", Total: 1, Pending: 1},
+		{Date: day21, Chs: 1, Segments: 1, Seconds: 3600, Bytes: 30,
+			Total: 1, Local: 1},
+		{Date: day20, Chs: 1, Segments: 2, Seconds: 2 * 3600, Bytes: 125,
+			Total: 4, Local: 2, Failed: 1, Pending: 1},
 	}
 	if !reflect.DeepEqual(ch1, wantCh1) {
 		t.Errorf("Days(1) = %+v, want %+v", ch1, wantCh1)
 	}
 	if ch2 := s.Days(2); !reflect.DeepEqual(ch2, []DayInfo{
-		{Date: day20, Chs: 1, Segments: 1, Seconds: 3600, Bytes: 50},
+		{Date: day20, Chs: 1, Segments: 1, Seconds: 3600, Bytes: 50,
+			Total: 1, Local: 1},
 	}) {
 		t.Errorf("Days(2) = %+v", ch2)
 	}
@@ -878,6 +889,59 @@ func TestDaysMergesOverlappingSegmentsPerChannel(t *testing.T) {
 	}
 	if days[0].Segments != 4 || days[0].Bytes != 40 || days[0].Chs != 2 {
 		t.Errorf("day = %+v", days[0])
+	}
+	if days[0].Total != 4 || days[0].Local != 4 {
+		t.Errorf("counters = %+v, want total=local=4", days[0])
+	}
+	if !days[0].DaySynced() || days[0].DaySyncing() {
+		t.Errorf("DaySynced/DaySyncing = %v/%v, want true/false", days[0].DaySynced(), days[0].DaySyncing())
+	}
+}
+
+func TestDaysCountsQueuedSegments(t *testing.T) {
+	oldLocal := time.Local
+	time.Local = time.FixedZone("test-utc+8", 8*3600)
+	t.Cleanup(func() { time.Local = oldLocal })
+
+	s := openTestStore(t)
+	base := time.Date(2026, 10, 24, 0, 0, 0, 0, time.Local).Unix()
+	for _, seg := range []Segment{
+		// A half-synced day: 2 done, 1 downloading, 1 queued, 1 failed, 1 skipped.
+		{Ch: 1, Start: base + 0, End: base + 600, Status: "done", Bytes: 10},
+		{Ch: 1, Start: base + 600, End: base + 1200, Status: "done", Bytes: 10},
+		{Ch: 1, Start: base + 1200, End: base + 1800, Status: "syncing", Bytes: 0},
+		{Ch: 1, Start: base + 1800, End: base + 2400, Status: "pending", Bytes: 0},
+		{Ch: 1, Start: base + 2400, End: base + 3000, Status: "failed", Bytes: 0},
+		{Ch: 1, Start: base + 3000, End: base + 3600, Status: "skipped", Bytes: 0},
+		// An unknown status must not vanish from the day.
+		{Ch: 1, Start: base + 3600, End: base + 4200, Status: "weird", Bytes: 0},
+		// Next day: nothing local yet, still listed with total > local.
+		{Ch: 1, Start: base + 86400, End: base + 87000, Status: "pending", Bytes: 0},
+	} {
+		mustUpsert(t, s, seg)
+	}
+
+	days := s.Days(0)
+	if len(days) != 2 {
+		t.Fatalf("Days() = %+v, want 2 days", days)
+	}
+	next, half := days[0], days[1]
+	if next.Total != 1 || next.Local != 0 || next.Pending != 1 {
+		t.Errorf("next day counters = %+v", next)
+	}
+	if next.DaySynced() || !next.DaySyncing() {
+		t.Errorf("next day synced/syncing = %v/%v", next.DaySynced(), next.DaySyncing())
+	}
+	if half.Total != 7 || half.Local != 2 || half.Syncing != 1 || half.Pending != 2 ||
+		half.Failed != 1 || half.Skipped != 1 {
+		t.Errorf("half day counters = %+v", half)
+	}
+	// Local stats keep the old meaning: only the two done rows count.
+	if half.Segments != 2 || half.Seconds != 1200 || half.Bytes != 20 {
+		t.Errorf("half day local stats = %+v", half)
+	}
+	if half.DaySynced() || !half.DaySyncing() {
+		t.Errorf("half day synced/syncing = %v/%v", half.DaySynced(), half.DaySyncing())
 	}
 }
 
