@@ -133,7 +133,7 @@ func (c *Client) DownloadContext(ctx context.Context, ch int, from, to int64, w 
 	if opt.Idle <= 0 {
 		opt.Idle = defaultIdle
 	}
-	clientID, err := c.GetUserID()
+	clientID, err := c.GetUserIDContext(ctx)
 	if err != nil {
 		return stats, err
 	}

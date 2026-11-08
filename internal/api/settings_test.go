@@ -60,6 +60,34 @@ func TestSettingsRejectsInvalidCutoff(t *testing.T) {
 	}
 }
 
+// TestSettingsDownloadWorkers pins the new concurrency knob: it round-trips and
+// is bounded so a hand-edited config cannot flood the device with sessions.
+func TestSettingsDownloadWorkers(t *testing.T) {
+	a := newTestAPI(t)
+	set := a.st.Settings()
+	set.DownloadWorkers = 2
+	if rec := a.do("PUT", "/api/settings", set); rec.Code != 200 {
+		t.Fatalf("PUT settings = %d; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := a.st.Settings().DownloadWorkers; got != 2 {
+		t.Errorf("download_workers = %d, want 2", got)
+	}
+	body := decodeBody(t, a.do("GET", "/api/settings", nil))
+	data, _ := body["data"].(map[string]any)
+	if got, _ := data["download_workers"].(float64); got != 2 {
+		t.Errorf("GET download_workers = %v, want 2", data["download_workers"])
+	}
+
+	for _, bad := range []int{-1, 5} {
+		set = a.st.Settings()
+		set.DownloadWorkers = bad
+		rec := a.do("PUT", "/api/settings", set)
+		if rec.Code != 400 {
+			t.Errorf("download_workers=%d = %d, want 400", bad, rec.Code)
+		}
+	}
+}
+
 func TestCrossOriginMutationRejected(t *testing.T) {
 	a := newTestAPI(t)
 	req := httptest.NewRequest("PUT", "/api/settings", strings.NewReader(`{}`))

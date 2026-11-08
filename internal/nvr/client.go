@@ -54,6 +54,11 @@ const (
 	streamBoundary = "client-stream-boundary"
 
 	maxDSBody = 32 << 20
+
+	// nvrUserIDAttempts / nvrUserIDBackoff bound the get_user_id retry ladder:
+	// 1s + 2s of backoff at most, and every wait is cancellable.
+	nvrUserIDAttempts = 3
+	nvrUserIDBackoff  = time.Second
 )
 
 // ErrNoMedia is returned by MediaList when the NVR replies -71104/-40101:
@@ -184,6 +189,15 @@ func (c *Client) loginLocked() error {
 		stok, err := c.loginAt(base)
 		if err != nil {
 			lastErr = fmt.Errorf("%s: %w", base, err)
+			// A wrong password or a missing account fails on every port.
+			// Only an unreachable port (refused, timeout) justifies walking
+			// the rest of the probe list: probing four ports for bad
+			// credentials costs up to 4x the connect timeout, which is what
+			// made a misconfigured sync look like it was "preparing" forever.
+			if isCredentialError(err) {
+				lastErr = fmt.Errorf("%s: %w（凭据错误，停止探测其它端口）", base, err)
+				break
+			}
 			continue
 		}
 		c.base = base
@@ -192,6 +206,16 @@ func (c *Client) loginLocked() error {
 		return nil
 	}
 	return fmt.Errorf("nvr: management API login failed (tried ports %v): %w", ports, lastErr)
+}
+
+// isCredentialError reports whether err is a definitive authentication
+// rejection (as opposed to the port simply not answering).
+func isCredentialError(err error) bool {
+	msg := err.Error()
+	// loginAt reports the device's own error_code; -40404/-40224 are the
+	// observed "wrong password" / "no such user" answers on this firmware.
+	return strings.Contains(msg, "login: error_code=") &&
+		!strings.Contains(msg, "error_code=0")
 }
 
 func (c *Client) loginAt(base string) (string, error) {
@@ -227,65 +251,107 @@ func (c *Client) loginAt(base string) (string, error) {
 // transient and should be retried with a fresh login instead of turning every
 // queued download into a permanent "failed" row.
 func (c *Client) GetUserID() (int, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	return c.GetUserIDContext(context.Background())
+}
 
+// GetUserIDContext is GetUserID with cancellation. The retry backoff honours
+// ctx, so canceling a sync aborts a blocked get_user_id instead of sleeping
+// for the full ladder (up to 1s+2s) with the device session held.
+func (c *Client) GetUserIDContext(ctx context.Context) (int, error) {
+	// The retry ladder is bounded per client, so a shared client does not
+	// hold the mutex for the whole backoff while other workers wait.
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < nvrUserIDAttempts; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(attempt) * time.Second)
-		}
-		if c.stok == "" {
-			if err := c.loginLocked(); err != nil {
-				lastErr = err
-				continue
+			if !c.sleepCtx(ctx, time.Duration(attempt)*nvrUserIDBackoff) {
+				if lastErr == nil {
+					lastErr = ctx.Err()
+				}
+				return 0, fmt.Errorf("get_user_id: %w", lastErr)
 			}
 		}
-		if c.userID > 0 {
-			return c.userID, nil
+		uid, err, retry := c.getUserIDOnce(ctx)
+		if err == nil {
+			return uid, nil
 		}
-		raw, err := c.callLocked(map[string]any{
-			"system": map[string]any{"get_user_id": nil},
-			"method": "do",
-		})
-		if err != nil {
-			lastErr = err
-			c.stok = ""
-			continue
+		lastErr = err
+		if !retry || ctx.Err() != nil {
+			return 0, err
 		}
-		var r struct {
-			UserID    int `json:"user_id"`
-			ErrorCode int `json:"error_code"`
-			System    struct {
-				UserID int `json:"get_user_id"`
-			} `json:"system"`
-		}
-		if err := json.Unmarshal(raw, &r); err != nil {
-			return 0, fmt.Errorf("get_user_id: bad response: %w (raw %.200s)", err, raw)
-		}
-		if r.ErrorCode == -40401 {
-			lastErr = fmt.Errorf("get_user_id: error_code=%d (NVR busy)", r.ErrorCode)
-			c.stok = ""
-			c.userID = 0
-			continue
-		}
-		if r.ErrorCode != 0 {
-			return 0, fmt.Errorf("get_user_id: error_code=%d", r.ErrorCode)
-		}
-		switch {
-		case r.UserID > 0:
-			c.userID = r.UserID
-		case r.System.UserID > 0:
-			c.userID = r.System.UserID
-		default:
-			return 0, fmt.Errorf("get_user_id: no user_id in response (raw %.200s)", raw)
-		}
-		return c.userID, nil
 	}
 	if lastErr == nil {
 		lastErr = errors.New("get_user_id: no attempt made")
 	}
 	return 0, fmt.Errorf("get_user_id after retries: %w", lastErr)
+}
+
+// getUserIDOnce performs one get_user_id round trip. retry reports whether the
+// failure is worth another attempt (login lost, -40401, transport error).
+func (c *Client) getUserIDOnce(ctx context.Context) (uid int, err error, retry bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.userID > 0 {
+		return c.userID, nil, false
+	}
+	if ctx.Err() != nil {
+		return 0, ctx.Err(), false
+	}
+	if c.stok == "" {
+		if err := c.loginLocked(); err != nil {
+			return 0, err, true
+		}
+	}
+	raw, err := c.callLocked(map[string]any{
+		"system": map[string]any{"get_user_id": nil},
+		"method": "do",
+	})
+	if err != nil {
+		c.stok = ""
+		return 0, err, true
+	}
+	var r struct {
+		UserID    int `json:"user_id"`
+		ErrorCode int `json:"error_code"`
+		System    struct {
+			UserID int `json:"get_user_id"`
+		} `json:"system"`
+	}
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return 0, fmt.Errorf("get_user_id: bad response: %w (raw %.200s)", err, raw), false
+	}
+	if r.ErrorCode == -40401 {
+		c.stok = ""
+		c.userID = 0
+		return 0, fmt.Errorf("get_user_id: error_code=%d (NVR busy)", r.ErrorCode), true
+	}
+	if r.ErrorCode != 0 {
+		return 0, fmt.Errorf("get_user_id: error_code=%d", r.ErrorCode), false
+	}
+	switch {
+	case r.UserID > 0:
+		c.userID = r.UserID
+	case r.System.UserID > 0:
+		c.userID = r.System.UserID
+	default:
+		return 0, fmt.Errorf("get_user_id: no user_id in response (raw %.200s)", raw), false
+	}
+	return c.userID, nil, false
+}
+
+// sleepCtx waits for d or ctx, whichever comes first, and reports which.
+func (c *Client) sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 func (c *Client) callLocked(v any) (json.RawMessage, error) {

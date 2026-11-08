@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,9 +41,18 @@ import (
 )
 
 const (
-	// downloadWorkers stays below the device's 8-session limit while still
-	// hiding per-request latency.
-	downloadWorkers = 2
+	// defaultDownloadWorkers is how many segments are pulled at once when
+	// Settings.DownloadWorkers is unset.
+	//
+	// One is deliberate: a single download already saturates the device's
+	// 100 Mbit interface (89 Mbps measured, ~11.2 MB/s, see DL_MEASURE.md in
+	// the nvr2rtc repository), so a second worker adds no throughput. It only
+	// competes for the same link, burns another of the device's few media
+	// sessions and doubles the chance of a -40401 storm when the NVR is busy.
+	defaultDownloadWorkers = 1
+	// maxDownloadWorkers is capped well below the device's stream_max_sessions
+	// (8) so scans and the catalogue refresh still fit.
+	maxDownloadWorkers = 4
 	// maxAttempts includes the first try: two retries after a failure.
 	maxAttempts = 3
 	// maxBusyStreak stops one run after this many consecutive busy failures,
@@ -51,6 +61,10 @@ const (
 	// maxFailedPerRun bounds automatic retries of the permanent-looking
 	// backlog. Pending segments are always processed first.
 	maxFailedPerRun = 200
+	// failedAttemptsBeforeBackoff lets a row be retried on the round after its
+	// first failure, so a transient hiccup is not punished with the full
+	// backoff. From the second failure on, failedRetryBackoff applies.
+	failedAttemptsBeforeBackoff = 1
 	// minFreeBytes keeps the last gigabyte of the volume free for SQLite,
 	// sidecars and the OS; a 1 GB NVR segment can otherwise fill the disk.
 	minFreeBytes = 1 << 30
@@ -77,7 +91,19 @@ var (
 	// segment can be fetched later, so they back off much longer than a plain
 	// retry and the segment stays pending instead of being marked failed.
 	transientRetryBase = 10 * time.Second
+	// failedRetryBase is the per-segment cooldown for rows in the "failed"
+	// state; it doubles with each consecutive failure up to failedRetryMax.
+	// Without it every run re-tried the same maxFailedPerRun failures first,
+	// each with its full 3-attempt ladder, so a multi-thousand-row backlog
+	// kept a run busy for tens of minutes without downloading anything new.
+	failedRetryBase = 10 * time.Minute
+	failedRetryMax  = 6 * time.Hour
 )
+
+// retrySleep is the canceller-aware wait used between download attempts. It is
+// a variable so a test can shorten the backoff without touching the production
+// pacing constants above.
+var retrySleep = sleepCtx
 
 // ErrAlreadyRunning is returned by Start when a sync is already in flight.
 var ErrAlreadyRunning = errors.New("syncer: sync already running")
@@ -116,12 +142,76 @@ type Syncer struct {
 	catalogAt   time.Time
 	catalogLast CatalogResult
 
+	// nvrSession serialises *ownership* of the device's media sessions: a
+	// sync run and a catalogue refresh must never talk to the NVR at the same
+	// time. The device has a small session budget (stream_max_sessions=8) and
+	// answers -40401 when it runs out, so overlapping work turns into a retry
+	// storm. The old guard was `!s.Running()`, which races both ways: the
+	// catalogue could start in the window between Start() and the run goroutine
+	// setting the flag, and a sync could start on top of a running catalogue.
+	nvrSession chan struct{}
+	// activeSession names the current holder ("sync" / "catalog") for logs.
+	activeSession atomic.Value
+
 	// Stale .part files are removed once per process, not on every run.
 	cleanupOnce sync.Once
 }
 
 // New returns a Syncer backed by st.
-func New(st *store.Store) *Syncer { return &Syncer{st: st} }
+func New(st *store.Store) *Syncer {
+	return &Syncer{st: st, nvrSession: make(chan struct{}, 1)}
+}
+
+// acquireNVR takes exclusive ownership of the NVR session budget until release
+// is called. It blocks until the current holder (if any) is done or ctx is
+// cancelled, and logs once when it has to wait so a queued run is visible in
+// the sync log instead of looking stuck.
+//
+// Every path that logs in to the device or opens a media session must hold
+// this lock: sync runs, catalogue refreshes and on-demand scans.
+func (s *Syncer) acquireNVR(ctx context.Context, who string) (func(), error) {
+	select {
+	case s.nvrSession <- struct{}{}:
+	default:
+		s.st.Log("info", who, fmt.Sprintf("%s 正在等待 NVR 会话（%s 占用中）", whoLabel(who), s.SessionHolder()))
+		select {
+		case s.nvrSession <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	s.activeSession.Store(who)
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.activeSession.Store("")
+			<-s.nvrSession
+		})
+	}, nil
+}
+
+// SessionHolder reports which activity currently owns the NVR session, or ""
+// when the device is idle. It is for diagnostics and tests.
+func (s *Syncer) SessionHolder() string {
+	if v, ok := s.activeSession.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
+// whoLabel is the human-readable form of a session owner for logs.
+func whoLabel(who string) string {
+	switch who {
+	case "sync":
+		return "同步"
+	case "catalog":
+		return "对账"
+	case "scan":
+		return "扫描"
+	default:
+		return who
+	}
+}
 
 // Start validates the request, marks the sync as running and returns
 // immediately; the work happens in a background goroutine. Progress is
@@ -281,6 +371,7 @@ type progress struct {
 	mu      sync.Mutex
 	started int64
 	cur     string
+	phase   string
 	done    int
 	total   int
 	bytes   int64
@@ -293,6 +384,7 @@ func (p *progress) state(running bool) store.SyncState {
 	st := store.SyncState{
 		Running:   running,
 		Cur:       p.cur,
+		Phase:     p.phase,
 		Done:      p.done,
 		Total:     p.total,
 		Bytes:     p.bytes,
@@ -308,6 +400,14 @@ func (p *progress) state(running bool) store.SyncState {
 func (p *progress) setCur(cur string) {
 	p.mu.Lock()
 	p.cur = cur
+	p.mu.Unlock()
+}
+
+// setPhase records what the run is doing before its queue exists, so the UI
+// can distinguish "reading the index" from "waiting for the NVR session".
+func (p *progress) setPhase(phase string) {
+	p.mu.Lock()
+	p.phase = phase
 	p.mu.Unlock()
 }
 
@@ -355,9 +455,36 @@ func (s *Syncer) run(ctx context.Context, req SyncRequest, done chan struct{}) {
 		close(done)
 	}()
 
+	p.setPhase(store.PhaseQueue)
 	s.publish(p, true)
 	scope := channelList(req.Channels)
 	s.st.Log("info", "scan", fmt.Sprintf("开始同步：通道 %v，范围 %s", scope, describeRange(req)))
+
+	// Build the queue before touching the NVR: it only reads the local index,
+	// and an empty queue means there is no reason to take the session at all.
+	queue := s.collectQueue(req.Channels, req.From, req.To)
+	p.setTotal(len(queue))
+	p.setPhase("")
+	s.publish(p, true)
+	if len(queue) == 0 {
+		s.st.Log("info", "scan", "没有需要下载的录像段")
+		if settings.RetentionD > 0 {
+			s.cleanupRetention(settings)
+		}
+		return
+	}
+
+	p.setPhase(store.PhaseWaitingNVR)
+	s.publish(p, true)
+	release, err := s.acquireNVR(ctx, "sync")
+	if err != nil {
+		p.setError(err)
+		s.st.Log("warn", "scan", "同步在等待 NVR 会话时被取消")
+		return
+	}
+	defer release()
+	p.setPhase("")
+	s.publish(p, true)
 
 	client := nvr.New(settings.NVRHost, settings.NVRUser, settings.NVRPass, settings.AdminPort)
 	if err := client.Login(); err != nil {
@@ -371,18 +498,14 @@ func (s *Syncer) run(ctx context.Context, req SyncRequest, done chan struct{}) {
 	// local index already knows about.
 	s.st.Log("info", "scan", "使用本地索引（对账由后台按设置执行）")
 
-	queue := s.collectQueue(req.Channels, req.From, req.To)
-	p.setTotal(len(queue))
-	s.publish(p, true)
-	if len(queue) == 0 {
-		s.st.Log("info", "scan", "没有需要下载的录像段")
-	} else if free, ok := freeBytes(settings.StorageDir); ok && free < minFreeBytes {
+	if free, ok := freeBytes(settings.StorageDir); ok && free < minFreeBytes {
 		err := fmt.Errorf("存储空间不足：仅剩 %s，至少保留 %s", humanBytes(free), humanBytes(minFreeBytes))
 		p.setError(err)
 		s.st.Log("error", "scan", err.Error())
 	} else {
-		s.st.Log("info", "download", fmt.Sprintf("待下载 %d 段，并发 %d", len(queue), downloadWorkers))
-		s.downloadAll(ctx, client, settings, queue, p)
+		workers := downloadWorkers(settings)
+		s.st.Log("info", "download", fmt.Sprintf("待下载 %d 段，并发 %d", len(queue), workers))
+		s.downloadAll(ctx, client, settings, queue, workers, p)
 	}
 
 	if settings.RetentionD > 0 {
@@ -442,7 +565,8 @@ func (s *Syncer) collectQueue(channels []int, from, to int64) []store.Segment {
 	// Segments left pending from earlier runs must respect the cutoff too,
 	// otherwise a manual run could still pull a segment that Settings.Cutoff
 	// forbids (and that may still be growing).
-	cutoff := syncCutoff(s.st.Settings(), time.Now().Unix())
+	now := time.Now().Unix()
+	cutoff := syncCutoff(s.st.Settings(), now)
 	for _, seg := range s.st.QueueSegments(channels, []string{"pending", "failed", "syncing"}) {
 		status := seg.Status
 		k := segKey{seg.Ch, seg.Start, seg.End}
@@ -473,13 +597,19 @@ func (s *Syncer) collectQueue(channels []int, from, to int64) []store.Segment {
 		if to > 0 && seg.Start >= to {
 			continue
 		}
-		if isLive(seg, time.Now().Unix()) {
+		if isLive(seg, now) {
 			// Still recording: keep it pending and retry next round
 			// instead of persisting a truncated file.
 			s.st.LogCh(seg.Ch, "info", "download", fmt.Sprintf("%s 仍在写入，稍后再同步", segTime(seg)))
 			continue
 		}
 		if status == "failed" {
+			// A repeated failure backs off for a growing cooldown, so a
+			// large failed backlog no longer crowds out fresh pending work
+			// on every single run.
+			if !failedRetryDue(seg, now) {
+				continue
+			}
 			if failedCount >= maxFailedPerRun {
 				continue
 			}
@@ -516,7 +646,10 @@ func (s *Syncer) listStatus(status string) []store.Segment {
 // Download
 // ---------------------------------------------------------------------------
 
-func (s *Syncer) downloadAll(ctx context.Context, client *nvr.Client, settings store.Settings, queue []store.Segment, p *progress) {
+func (s *Syncer) downloadAll(ctx context.Context, client *nvr.Client, settings store.Settings, queue []store.Segment, workers int, p *progress) {
+	if workers < 1 {
+		workers = 1
+	}
 	jobs := make(chan store.Segment)
 	var wg sync.WaitGroup
 	var busyStreak atomic.Int32
@@ -528,7 +661,7 @@ func (s *Syncer) downloadAll(ctx context.Context, client *nvr.Client, settings s
 			s.st.Log("warn", "download", "NVR 连续繁忙，本轮提前收尾，剩余段保留到下一轮")
 		})
 	}
-	for i := 0; i < downloadWorkers; i++ {
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -594,7 +727,7 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 				delay = transientRetryBase << (attempt - 1)
 			}
 			s.st.LogCh(seg.Ch, "warn", "download", fmt.Sprintf("%s 第 %d 次重试（等待 %s）", label, attempt, delay))
-			if !sleepCtx(ctx, delay) {
+			if !retrySleep(ctx, delay) {
 				break
 			}
 		}
@@ -686,12 +819,51 @@ func (s *Syncer) downloadOne(ctx context.Context, client *nvr.Client, storageDir
 
 func (s *Syncer) markFailed(seg store.Segment, err error) {
 	_ = s.st.UpsertSegment(store.Segment{
-		Ch:     seg.Ch,
-		Start:  seg.Start,
-		End:    seg.End,
-		Status: "failed",
-		Err:    err.Error(),
+		Ch:       seg.Ch,
+		Start:    seg.Start,
+		End:      seg.End,
+		Status:   "failed",
+		SyncedAt: time.Now().Unix(),
+		Err:      failureRecord{failures: failedAttempts(seg.Err) + 1, msg: err.Error()}.String(),
 	})
+}
+
+// failureRecord is the shape stored in Segment.Err for a "failed" row: a
+// machine-readable attempt counter followed by the human-readable reason, e.g.
+//
+//	"failures=3: nvr: download: ..."
+//
+// The counter is what drives the per-segment retry backoff; wrapping it in the
+// message keeps the error column self-describing for the UI and for anyone
+// reading the SQLite file by hand.
+type failureRecord struct {
+	failures int
+	msg      string
+}
+
+func (f failureRecord) String() string {
+	return fmt.Sprintf("%s%d: %s", failurePrefix, f.failures, f.msg)
+}
+
+// failurePrefix prefixes the attempt counter in a failed row's Err.
+const failurePrefix = "failures="
+
+// failedAttempts extracts the attempt counter from a stored failure message.
+// Rows written before the counter existed parse as 0.
+func failedAttempts(errMsg string) int {
+	if !strings.HasPrefix(errMsg, failurePrefix) {
+		return 0
+	}
+	rest := errMsg[len(failurePrefix):]
+	colon := strings.IndexByte(rest, ':')
+	if colon <= 0 {
+		return 0
+	}
+	n, err := strconv.Atoi(rest[:colon])
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 // attemptDownload performs one download into <path>.part, validates it,
@@ -936,6 +1108,59 @@ func pathUnderStorage(storageDir, rel string) (string, bool) {
 // Helpers
 // ---------------------------------------------------------------------------
 
+// downloadWorkers resolves Settings.DownloadWorkers into a usable worker count.
+// The default is 1 because a single download already saturates the device's
+// 100 Mbit link; larger values are only useful on a gigabit deployment.
+func downloadWorkers(settings store.Settings) int {
+	n := settings.DownloadWorkers
+	if n <= 0 {
+		n = defaultDownloadWorkers
+	}
+	if n > maxDownloadWorkers {
+		n = maxDownloadWorkers
+	}
+	return n
+}
+
+// failedRetryDue reports whether a "failed" row may be retried now, given how
+// many consecutive runs have already failed on it and when it last synced.
+//
+// The first failure is retried on the next run; afterwards the cooldown doubles
+// with every failure up to failedRetryMax. This keeps a multi-thousand-row
+// failure backlog from being re-attempted (each with its full retry ladder)
+// ahead of fresh work on every single run.
+func failedRetryDue(seg store.Segment, now int64) bool {
+	attempts := failedAttempts(seg.Err)
+	if attempts <= failedAttemptsBeforeBackoff {
+		return true
+	}
+	last := seg.SyncedAt
+	if last <= 0 {
+		// No timestamp: treat it as long overdue rather than never retrying.
+		return true
+	}
+	return now-last >= int64(failedRetryBackoff(attempts)/time.Second)
+}
+
+// failedRetryBackoff returns the cooldown for a row that has failed attempts
+// times in a row.
+func failedRetryBackoff(attempts int) time.Duration {
+	if attempts <= failedAttemptsBeforeBackoff {
+		return 0
+	}
+	d := failedRetryBase
+	for i := failedAttemptsBeforeBackoff + 1; i < attempts; i++ {
+		d *= 2
+		if d >= failedRetryMax {
+			return failedRetryMax
+		}
+	}
+	if d > failedRetryMax {
+		d = failedRetryMax
+	}
+	return d
+}
+
 func cleanChannels(in []int) []int {
 	seen := make(map[int]bool, len(in))
 	out := make([]int, 0, len(in))
@@ -1042,6 +1267,14 @@ func (s *Syncer) ScanOnly(ctx context.Context, channels []int, from, to int64) (
 		return 0, 0, errors.New("from 必须早于 to")
 	}
 	cutoff := syncCutoff(settings, now.Unix())
+
+	// A scan logs in and page-s through the media list; it must not overlap a
+	// sync or a catalogue refresh on the same device.
+	release, err := s.acquireNVR(ctx, "scan")
+	if err != nil {
+		return 0, 0, err
+	}
+	defer release()
 
 	client := nvr.New(settings.NVRHost, settings.NVRUser, settings.NVRPass, settings.AdminPort)
 	if err := client.Login(); err != nil {
@@ -1199,9 +1432,13 @@ func (s *Syncer) CatalogLoop(ctx context.Context) {
 	}
 	for {
 		settings := s.st.Settings()
-		if settings.CatalogDays > 0 && !s.Running() {
-			if _, err := s.RefreshCatalog(ctx); err != nil {
-				s.st.Log("error", "catalog", "自动对账失败: "+err.Error())
+		if settings.CatalogDays > 0 {
+			// Do not even try while a sync owns the device: RefreshCatalog
+			// would only queue up behind it and then log a "failed" line.
+			if !s.Running() && s.SessionHolder() == "" {
+				if _, err := s.RefreshCatalog(ctx); err != nil {
+					s.st.Log("error", "catalog", "自动对账失败: "+err.Error())
+				}
 			}
 		}
 		poll := catalogPoll
@@ -1271,6 +1508,14 @@ func (s *Syncer) refreshCatalogDays(ctx context.Context, force, allowRunning boo
 	from := now.AddDate(0, 0, -days).Unix()
 	to := now.Unix()
 	cutoff := syncCutoff(settings, now.Unix())
+
+	// The catalogue reads the device; it must not run on top of a sync (or of
+	// another scan). Wait for the session instead of hammering the NVR.
+	release, err := s.acquireNVR(ctx, "catalog")
+	if err != nil {
+		return res, err
+	}
+	defer release()
 
 	client := nvr.New(settings.NVRHost, settings.NVRUser, settings.NVRPass, settings.AdminPort)
 	if err := client.Login(); err != nil {

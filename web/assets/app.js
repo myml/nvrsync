@@ -605,6 +605,7 @@
       storage_dir: typeof raw.storage_dir === 'string' ? raw.storage_dir : '',
       channels: channels,
       auto_minutes: toInt(raw.auto_minutes, 0),
+      download_workers: toInt(raw.download_workers, 0),
       retention_days: toInt(raw.retention_days, 0),
       transcode: !!raw.transcode,
       ffmpeg: typeof raw.ffmpeg === 'string' ? raw.ffmpeg : '',
@@ -1586,9 +1587,14 @@
     var pct = total > 0 ? Math.min(100, (done / total) * 100) : 0;
 
     view.progressFill.style.width = pct + '%';
+    // total==0 means the queue is not built yet. Say which wait it is instead
+    // of showing one ambiguous "准备中" label: a run queued behind a catalogue
+    // refresh used to look like a stuck scan.
     view.progressLabel.textContent = total > 0
       ? '同步中 ' + num(done) + '/' + num(total)
-      : '同步中（准备队列…）';
+      : (st.phase === 'waiting_nvr'
+        ? '正在等待 NVR 会话（对账占用中）'
+        : '同步中（准备队列…）');
 
     var parts = [];
     if (total > 0) parts.push(done + '/' + total + ' 段');
@@ -2621,6 +2627,11 @@
       min: '0', step: '1'
     });
 
+    var workersInput = el('input', {
+      class: 'control', id: 'set-workers', type: 'number',
+      value: String(saved.download_workers || 0), min: '0', max: '4', step: '1'
+    });
+
     var catalogInput = el('input', {
       class: 'control', id: 'set-catalog', type: 'number', value: String(saved.catalog_days),
       min: '0', step: '1'
@@ -2796,6 +2807,10 @@
           hint: '只同步到此时间之前。「昨天」表示今天的录像等明天再同步，永远不会碰到正在写入的段。'
         }),
         cutoffDaysField,
+        field('并发下载（路）', workersInput, {
+          id: 'set-workers',
+          hint: '0 表示默认 1 路。NVR 只有百兆网口，单路已跑满带宽；调大只会抢占同一条链路和会话，不建议超过 2。'
+        }),
         field('保留天数', retentionInput, {
           id: 'set-retention',
           hint: '0 表示不自动删除旧录像。'
@@ -3084,6 +3099,7 @@
       storage_dir: String(value('set-storage')).trim(),
       channels: channels,
       auto_minutes: toInt(value('set-auto'), 0),
+      download_workers: toInt(value('set-workers'), 0),
       retention_days: toInt(value('set-retention'), 0),
       transcode: !!(form.querySelector('#set-transcode') || {}).checked,
       ffmpeg: String(value('set-ffmpeg')).trim(),
@@ -3106,6 +3122,9 @@
       return '管理端口需在 0–65535 之间';
     }
     if (settings.auto_minutes < 0) return '自动同步间隔不能为负数';
+    if (settings.download_workers < 0 || settings.download_workers > 4) {
+      return '并发下载需在 0–4 之间（0 表示默认 1）';
+    }
     if (settings.retention_days < 0) return '保留天数不能为负数';
     if (settings.cutoff === 'days' && settings.cutoff_days < 1) return '截止天数至少为 1';
     if (settings.catalog_days < 0) return '对账范围不能为负数';

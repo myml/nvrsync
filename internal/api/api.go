@@ -266,6 +266,10 @@ func validateSettings(v store.Settings) error {
 		return fmt.Errorf("auto_minutes must not be negative")
 	case v.RetentionD < 0:
 		return fmt.Errorf("retention_days must not be negative")
+	case v.DownloadWorkers < 0 || v.DownloadWorkers > 4:
+		// The device serves at most 8 media sessions and one download already
+		// saturates its 100 Mbit link, so more workers only add contention.
+		return fmt.Errorf("download_workers must be between 0 and 4")
 	case v.CutoffDays < 0:
 		return fmt.Errorf("cutoff_days must not be negative")
 	case v.CatalogDays < 0:

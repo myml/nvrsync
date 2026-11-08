@@ -70,9 +70,13 @@ type Settings struct {
 	StorageDir  string `json:"storage_dir"`
 	Channels    []int  `json:"channels"`
 	AutoMinutes int    `json:"auto_minutes"`
-	RetentionD  int    `json:"retention_days"`
-	Transcode   bool   `json:"transcode"`
-	FFmpeg      string `json:"ffmpeg"`
+	// DownloadWorkers is how many segments are downloaded concurrently.
+	// 0 means the built-in default (1), which already saturates a 100 Mbit
+	// NVR link; the value is clamped by the syncer rather than here.
+	DownloadWorkers int    `json:"download_workers"`
+	RetentionD      int    `json:"retention_days"`
+	Transcode       bool   `json:"transcode"`
+	FFmpeg          string `json:"ffmpeg"`
 	// Cutoff limits how recent a recording may be to be synced:
 	// "latest" (now), "yesterday" (end of yesterday) or "days" (N days ago,
 	// CutoffDays). Synchronising only closed days never touches a segment
@@ -104,8 +108,13 @@ type Settings struct {
 // Cur is the label of the segment currently being downloaded, Done is the
 // number of finished segments and Total is the planned segment count.
 type SyncState struct {
-	Running   bool    `json:"running"`
-	Cur       string  `json:"cur"`
+	Running bool   `json:"running"`
+	Cur     string `json:"cur"`
+	// Phase names what the run is doing while Total is still 0, so the UI can
+	// explain a wait instead of showing a frozen "preparing" label:
+	// "queue" (reading the local index) or "waiting_nvr" (queued behind a
+	// catalogue refresh / scan that owns the device session).
+	Phase     string  `json:"phase"`
 	Done      int     `json:"done"`
 	Total     int     `json:"total"`
 	Bytes     int64   `json:"bytes"`
@@ -113,6 +122,12 @@ type SyncState struct {
 	StartedAt int64   `json:"started_at"`
 	LastError string  `json:"last_error"`
 }
+
+// Sync phase values reported through SyncState.Phase.
+const (
+	PhaseQueue      = "queue"
+	PhaseWaitingNVR = "waiting_nvr"
+)
 
 // DayInfo is a per-day aggregate of the segments indexed for that day.
 //

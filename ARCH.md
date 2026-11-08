@@ -44,6 +44,7 @@ type Settings struct {
     StorageDir  string `json:"storage_dir"`   // 录像落盘根目录
     Channels    []int  `json:"channels"`      // 要同步的通道
     AutoMinutes int    `json:"auto_minutes"`  // 自动同步间隔（分钟），0=关闭
+    DownloadWorkers int `json:"download_workers"` // 并发下载路数，0=默认 1，上限 4
     RetentionD  int    `json:"retention_days"`// 0=不删
     Transcode   bool   `json:"transcode"`     // 是否用 ffmpeg 生成 H.264 代理
     FFmpeg      string `json:"ffmpeg"`        // ffmpeg 路径
@@ -61,6 +62,20 @@ type Settings struct {
 ```
 
 锁：store 内部 `sync.RWMutex`，每次写用「临时文件 + rename」保证原子性。
+
+### NVR 会话锁（关键不变量）
+
+同一台 NVR 的**媒体会话预算很小**（`stream_max_sessions=8`），且单路下载已能跑满它的百兆网口。
+因此 syncer 内部用 `nvrSession`（容量 1 的 channel）保证**同一时刻只有一个活动占用 NVR 会话**：
+
+- 持有者：`sync`（同步）、`catalog`（后台对账 / 手动刷新）、`scan`（`POST /api/nvr/scan`）；
+- 任何会登录 NVR 或打开媒体会话的路径都必须先 `acquireNVR(ctx, who)`，结束 `release()`；
+- 等待是**可取消**的（`ctx` 结束即返回），同步等待时会记录一条「正在等待 NVR 会话」日志，
+  `SyncState.Phase` 同步变为 `waiting_nvr`，前端据此显示等待原因；
+- 同步在**建好队列之后**才申请会话：队列为空时完全不碰 NVR。
+
+> 为什么需要它：旧实现用 `!s.Running()` 判断，存在双向竞态——对账可能在 `Start()` 与
+> run goroutine 置位之间挤进来，同步也能在对账进行中启动，两者并行会触发 `-40401` 重试风暴。
 
 ## 关键接口
 
@@ -87,6 +102,7 @@ func (c *Client) Download(ch int, from, to int64, w io.Writer, ackInterval time.
 // syncer
 func New(st *store.Store) *Syncer
 func (s *Syncer) Start(req SyncRequest) error   // 异步；返回后进度走 SyncState
+func (s *Syncer) SessionHolder() string         // 当前占用 NVR 会话的活动：sync/catalog/scan
 func (s *Syncer) Stop()
 func (s *Syncer) Running() bool
 
@@ -112,7 +128,7 @@ func (p *Player) EnsureProxy(ch int, date string) error           // 可选 ffmp
 | GET | `/api/stats?ch=&from=&to=` | 概览统计：各状态段数 + 最早/最新/占用/天数/存储；`from`/`to` 与 segments 同语义（区间重叠即计入），不含 status 维度，供列表上方概览与统计卡使用 |
 | POST | `/api/sync/start` | `{channels,from,to,force}`（from/to 可省略=自动） |
 | POST | `/api/sync/stop` | |
-| GET | `/api/sync/status` | `{running,cur,total,bytes,speed,started_at}` |
+| GET | `/api/sync/status` | `{running,cur,phase,total,bytes,speed,started_at}`；`phase` 为 `queue`（建队列）/`waiting_nvr`（等待 NVR 会话） |
 | GET | `/api/logs?limit=&level=` | 同步历史日志 |
 | GET | `/api/days?ch=` | `[{date,segments,seconds,bytes}]` |
 | GET | `/api/playlist?ch=&date=` | m3u8（`Content-Type: application/vnd.apple.mpegurl`） |
